@@ -1,0 +1,91 @@
+name: update
+
+# Bump sources.json to the newest amd64 build in Anthropic's APT index.
+#
+# The contract this workflow enforces: a PR is opened only if the new version
+# *actually builds*. A hash bump that produces a broken derivation must fail
+# the run and leave the repository untouched — never open a PR that a human
+# then has to discover is red.
+on:
+  schedule:
+    # Daily at 05:17 UTC. Off-the-hour to avoid the cron thundering herd.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+# Needed by peter-evans/create-pull-request.
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      # The runner's disk is tight: the .deb is ~160 MB and the unpacked
+      # derivation is ~500 MB, plus the whole GTK/NSS closure.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Bump sources.json
+        id: bump
+        run: |
+          nix develop --command ./pkgs/update.sh | tee -a "$GITHUB_OUTPUT"
+
+      # Everything below is skipped when already up to date, so the common
+      # no-op run costs one index fetch.
+      - name: Build the new version
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          echo "::group::nix build"
+          nix build .#default -L
+          echo "::endgroup::"
+
+          # Prove the output is actually usable, not merely buildable: a bad
+          # autoPatchelf run still produces a store path.
+          test -x ./result/bin/claude-desktop
+          test -f ./result/lib/claude-desktop/chrome-sandbox
+          test -f ./result/share/applications/com.anthropic.Claude.desktop
+
+      - name: Run flake checks
+        if: steps.bump.outputs.changed == 'true'
+        run: nix flake check -L
+
+      - name: Open pull request
+        if: steps.bump.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: update/claude-desktop-${{ steps.bump.outputs.version }}
+          base: main
+          commit-message: "claude-desktop: ${{ steps.bump.outputs.version }}"
+          title: "claude-desktop: ${{ steps.bump.outputs.version }}"
+          delete-branch: true
+          add-paths: |
+            sources.json
+          body: |
+            Automated bump to **${{ steps.bump.outputs.version }}** from
+            [Anthropic's APT index](https://downloads.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages).
+
+            Verified in CI before this PR was opened:
+
+            - the download hash matches the SHA256 published in the index
+            - `nix build .#default` succeeds
+            - the output has an executable wrapper, `chrome-sandbox`, and a desktop entry
+            - `nix flake check` passes
+
+            Upstream ships no changelog for the Linux builds, so there is
+            nothing to link beyond the version bump itself.
