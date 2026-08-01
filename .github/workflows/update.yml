@@ -38,12 +38,18 @@ jobs:
       # derivation is ~500 MB, plus the whole GTK/NSS closure.
       - name: Free disk space
         run: |
+          set -euo pipefail
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           df -h /
 
+      # pipefail is load-bearing here, not boilerplate: GitHub runs `run:`
+      # blocks as `bash -e {0}` with NO pipefail, so the exit status of
+      # `update.sh | tee` is tee's, which is always 0. Without it, update.sh
+      # aborting on a hash mismatch would leave this step green.
       - name: Bump sources.json
         id: bump
         run: |
+          set -euo pipefail
           nix develop --command ./pkgs/update.sh | tee -a "$GITHUB_OUTPUT"
 
       # Everything below is skipped when already up to date, so the common
@@ -51,6 +57,7 @@ jobs:
       - name: Build the new version
         if: steps.bump.outputs.changed == 'true'
         run: |
+          set -euo pipefail
           echo "::group::nix build"
           nix build .#default -L
           echo "::endgroup::"
@@ -63,7 +70,9 @@ jobs:
 
       - name: Run flake checks
         if: steps.bump.outputs.changed == 'true'
-        run: nix flake check -L
+        run: |
+          set -euo pipefail
+          nix flake check -L
 
       - name: Open pull request
         if: steps.bump.outputs.changed == 'true'

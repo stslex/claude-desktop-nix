@@ -63,6 +63,37 @@ $ readlink /proc/<renderer>/ns/user                         # → user:[40265340
 If you have deliberately set `user.max_user_namespaces = 0`, restore it rather
 than disabling the sandbox.
 
+### Hosts that cannot use the namespace sandbox
+
+On a hardened kernel, with `security.allowUserNamespaces = false`, or under an
+AppArmor userns restriction, the default output does not silently run
+unsandboxed — it **aborts**:
+
+```
+FATAL:sandbox/linux/suid/client/setuid_sandbox_host.cc:166]
+  The SUID sandbox helper binary was found, but is not configured correctly …
+  owned by root and has mode 4755
+```
+
+For those hosts there is an opt-in variant:
+
+```nix
+pkgs.claude-desktop.override { suidSandbox = true; }   # pairs with:
+security.chromiumSuidSandbox.enable = true;            # provides /run/wrappers/bin/chrome-sandbox
+```
+
+**Both halves are required.** The variant deletes the bundled `chrome-sandbox`
+and sets `CHROME_DEVEL_SANDBOX=/run/wrappers/bin/chrome-sandbox`. Deleting it is
+mandatory, not cosmetic: Chromium reads `CHROME_DEVEL_SANDBOX` **only** when no
+`chrome-sandbox` sits beside the executable. Measured directly — with the
+bundled helper present the error comes from `setuid_sandbox_host.cc:166` and
+names the store path (env var ignored); with it removed the error comes from
+line `156` and names `$CHROME_DEVEL_SANDBOX`. Setting the variable alone does
+nothing at all.
+
+The default output is unchanged by this option, and still never passes
+`--no-sandbox`.
+
 ## `--password-store`
 
 Defaults to `gnome-libsecret`, not `detect`. The bundled binary supports exactly
@@ -83,6 +114,41 @@ KDE users running kwalletd without the secret-service bridge:
 pkgs.claude-desktop.override { passwordStore = "kwallet6"; }
 ```
 
+### You must actually run a Secret Service provider
+
+This is a **host configuration requirement, not something the package can
+provide**. `gnome-libsecret` needs something owning `org.freedesktop.secrets`
+on the session bus. Without it Chromium falls back to a key derived from a
+hardcoded constant — still ciphertext, but decryptable by anyone with the file.
+
+NixOS:
+
+```nix
+services.gnome.gnome-keyring.enable = true;
+# and, so the keyring unlocks at login instead of prompting:
+security.pam.services.login.enableGnomeKeyring = true;
+```
+
+home-manager: `services.gnome-keyring.enable = true;`. KeePassXC with "Secret
+Service Integration" enabled also satisfies this.
+
+Verify it is live, and — more importantly — verify the *result*:
+
+```bash
+busctl --user list | grep org.freedesktop.secrets      # must be owned
+
+cp ~/.config/Claude/Cookies /tmp/c
+sqlite3 /tmp/c "select name, hex(substr(encrypted_value,1,3)) \
+  from cookies where name like 'sessionKey%'"
+```
+
+`763131` is ASCII **`v11`** — key came from the secret service. `763130`
+(**`v10`**) means libsecret was never reached and the encryption is
+obfuscation only. Checking that the value is merely "encrypted" does not
+distinguish the two; only the version tag does.
+
+Measured on this package: `sessionKey` and `sessionKeyLC` both `763131`.
+
 ## Dependency provenance
 
 `buildInputs` is derived from an `ldd` sweep of every ELF object in the `.deb`,
@@ -91,10 +157,25 @@ satisfied` on a clean build.
 
 The subtlety is that **`ldd` is not sufficient by itself**. Four libraries in
 upstream's `Depends` appear in no `DT_NEEDED` entry at all, and a further dozen
-are `dlopen`ed. `autoPatchelfHook` cannot see any of these; they are injected via
-`LD_LIBRARY_PATH` in the wrapper (see `runtimeLibs` in
-`pkgs/claude-desktop.nix`). Notably `libsecret-1.so.0` — miss it and credential
-storage silently degrades with no build-time error.
+are `dlopen`ed. `autoPatchelfHook` cannot discover any of these; they are named
+explicitly in `runtimeLibs` and appended to the **`DT_RUNPATH`** of every
+bundled ELF via the hook's `appendRunpaths`. Notably `libsecret-1.so.0` — miss
+it and credential storage silently degrades with no build-time error.
+
+**Why RUNPATH and not `LD_LIBRARY_PATH`.** `dlopen()` resolves against the
+calling object's own `DT_RUNPATH`, so the app finds these either way — but
+`LD_LIBRARY_PATH` is inherited by every child process, and it is searched
+*ahead of* a child's own `DT_RUNPATH`. The app spawns MCP servers, an
+integrated terminal and `cowork-linux-helper`; exporting the variable made
+those children prefer this package's `krb5` / `util-linux` / `libx11` over the
+versions they were linked against. RUNPATH is a property of the file, not the
+environment, so it does not leak. Verified: `libsecret-1.so.0` is mapped into
+the browser process with no `LD_LIBRARY_PATH` set at all.
+
+Note if you ever add to this: `autoPatchelfHook` registers itself in
+`postFixupHooks` and therefore runs **after** `postFixup`, calling
+`--set-rpath`. Hand-rolled `patchelf --add-rpath` in `postFixup` is silently
+discarded — use `appendRunpaths`.
 
 `resources/virtiofsd` needs `libseccomp.so.2` + `libcap-ng.so.0` and
 `node-pty`'s `pty.node` needs `libstdc++.so.6`; both are in `buildInputs` so
@@ -141,6 +222,16 @@ tooling.
 - **Cowork / KVM / Computer Use.** The `.deb` ships `virtiofsd`,
   `cowork-linux-helper` and a 27 MB `smol-bin.x64.img`; none of it is wired up.
   The app reports `computerUse: unsupported_platform` on Linux regardless.
+
+  **Cowork cannot start**, and that is by design here: the VM path requires
+  `qemuPath`, `firmwarePath` (OVMF) *and* `virtiofsd`, and neither qemu nor
+  OVMF is anywhere in this package's closure (`nix path-info -r … | grep -c
+  qemu` → `0`). `virtiofsd` is present only so `autoPatchelfHook` resolves its
+  `libseccomp` / `libcap-ng` and the build stays clean. Opening the Cowork tab
+  shows upstream's own message — *"requires QEMU. Install it with
+  `{installCommand}`, then restart Claude"* — where `{installCommand}` is an
+  **`apt` command that is wrong and unactionable on NixOS**. This is cosmetic;
+  nothing is broken by it.
 
 ## Licence
 

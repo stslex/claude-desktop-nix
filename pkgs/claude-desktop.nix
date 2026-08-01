@@ -83,6 +83,27 @@
 
   # Extra flags appended to the wrapper, e.g. [ "--enable-features=..." ].
   commandLineArgs ? [ ],
+
+  # Build a variant that uses the system SUID sandbox helper instead of the
+  # namespace sandbox. Off by default; the default output is unchanged.
+  #
+  # Only useful on a host that cannot use the namespace sandbox (hardened
+  # kernel, `security.allowUserNamespaces = false`, or an AppArmor userns
+  # restriction). There the default output aborts with
+  #
+  #   FATAL: The SUID sandbox helper binary was found, but is not configured
+  #   correctly ... owned by root and has mode 4755
+  #
+  # because Nix strips setuid bits from store paths. Pair this with
+  # `security.chromiumSuidSandbox.enable = true;`, which provides a setuid
+  # helper at /run/wrappers/bin/chrome-sandbox.
+  #
+  # Both halves are required and neither works alone. Measured directly
+  # (setuid_sandbox_host.cc line 166 vs 156): Chromium reads
+  # CHROME_DEVEL_SANDBOX *only* when no chrome-sandbox sits next to the
+  # executable. Setting the variable while the bundled helper is still
+  # present is silently ignored — so this option must also delete it.
+  suidSandbox ? false,
 }:
 
 let
@@ -92,10 +113,11 @@ let
       Only x86_64-linux is packaged today; see the arm64 TODO in flake.nix.
     '');
 
-  # Libraries the app dlopen()s at runtime. autoPatchelfHook cannot see these —
-  # they appear nowhere in DT_NEEDED, only as string literals in the binary —
-  # so they have to be injected via LD_LIBRARY_PATH or the feature silently
-  # no-ops. Each is a soname string-scanned out of the shipped executable.
+  # Libraries the app dlopen()s at runtime. autoPatchelfHook cannot discover
+  # these on its own — they appear nowhere in DT_NEEDED, only as string
+  # literals in the binary — so they are appended to the RUNPATH explicitly
+  # (see runtimeRpath) or the corresponding feature silently no-ops. Each is a
+  # soname string-scanned out of the shipped executable.
   runtimeLibs = [
     libsecret # libsecret-1.so.0   — safeStorage / os_crypt keyring
     libnotify # libnotify.so.4     — desktop notifications
@@ -113,6 +135,23 @@ let
     libxcursor # libXcursor.so.1
     libx11 # libX11-xcb.so.1
     libxcb # libxcb-{dri3,glx,present,sync}
+  ];
+
+  # The same set, plus the GPU driver link, as a RUNPATH fragment. This is
+  # appended to every bundled ELF instead of being exported as
+  # LD_LIBRARY_PATH from the wrapper.
+  #
+  # Why RUNPATH and not LD_LIBRARY_PATH: dlopen() resolves against the
+  # calling object's own DT_RUNPATH, so the app still finds these — but
+  # RUNPATH is a property of the ELF file, not of the environment, so it is
+  # NOT inherited by child processes. The app spawns MCP servers, an
+  # integrated terminal and cowork-linux-helper; with LD_LIBRARY_PATH those
+  # children searched our krb5 / util-linux / libx11 ahead of their own
+  # DT_RUNPATH (LD_LIBRARY_PATH outranks DT_RUNPATH), which can load a
+  # different soname version than the child was linked against. Moving to
+  # RUNPATH removes that shadowing by construction rather than narrowing it.
+  runtimeRpath = (map (p: "${lib.getLib p}/lib") runtimeLibs) ++ [
+    "${addDriverRunpath.driverLink}/lib"
   ];
 in
 stdenv.mkDerivation (finalAttrs: {
@@ -219,6 +258,13 @@ stdenv.mkDerivation (finalAttrs: {
     # set `user.max_user_namespaces = 0`, restore it — do not disable the
     # sandbox.
     chmod 0755 $out/lib/claude-desktop/chrome-sandbox
+    ${lib.optionalString suidSandbox ''
+
+      # suidSandbox: remove the bundled helper so Chromium falls through to
+      # CHROME_DEVEL_SANDBOX (set in the wrapper below). See the option's
+      # comment for why deleting it is mandatory rather than cosmetic.
+      rm $out/lib/claude-desktop/chrome-sandbox
+    ''}
 
     # Upstream ships `Exec=claude-desktop %U`, which only resolves if the
     # binary is on PATH. Pin all three Exec lines (main entry + the NewChat
@@ -230,20 +276,38 @@ stdenv.mkDerivation (finalAttrs: {
     runHook postInstall
   '';
 
-  postFixup = ''
-    makeWrapper $out/lib/claude-desktop/claude-desktop $out/bin/claude-desktop \
-      "''${gappsWrapperArgs[@]}" \
-      --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath runtimeLibs}" \
-      --suffix LD_LIBRARY_PATH : "${addDriverRunpath.driverLink}/lib" \
-      --add-flags "--ozone-platform-hint=auto" \
-      --add-flags "--password-store=${passwordStore}" \
-      ${lib.escapeShellArgs (
-        lib.concatMap (a: [
-          "--add-flags"
-          a
-        ]) commandLineArgs
-      )}
-  '';
+  # Appended to the RUNPATH of every ELF autoPatchelfHook patches. This is the
+  # hook's own mechanism — doing it by hand in postFixup does not work, because
+  # autoPatchelfHook registers itself in postFixupHooks and therefore runs
+  # *after* postFixup, calling --set-rpath and discarding anything added there.
+  appendRunpaths = runtimeRpath;
+
+  # Built as one escaped list rather than interpolated shell lines: an
+  # optional fragment that expands to "" would otherwise leave a blank line
+  # after a trailing backslash, silently ending the makeWrapper command.
+  postFixup =
+    let
+      wrapperArgs = [
+        "--add-flags"
+        "--ozone-platform-hint=auto"
+        "--add-flags"
+        "--password-store=${passwordStore}"
+      ]
+      ++ lib.optionals suidSandbox [
+        "--set"
+        "CHROME_DEVEL_SANDBOX"
+        "/run/wrappers/bin/chrome-sandbox"
+      ]
+      ++ lib.concatMap (a: [
+        "--add-flags"
+        a
+      ]) commandLineArgs;
+    in
+    ''
+      makeWrapper $out/lib/claude-desktop/claude-desktop $out/bin/claude-desktop \
+        "''${gappsWrapperArgs[@]}" \
+        ${lib.escapeShellArgs wrapperArgs}
+    '';
 
   passthru = {
     inherit (source) url;
