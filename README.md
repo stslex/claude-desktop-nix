@@ -192,6 +192,43 @@ advertises**, and rewrites `sources.json`. A divergence is a hard failure.
 after `nix build .#default` and `nix flake check` both pass — a version that
 bumps cleanly but builds broken fails the workflow instead of producing a red PR.
 
+## Testing this package without touching your profile
+
+Claude Desktop keeps everything under `$XDG_CONFIG_HOME/Claude`. A test launch
+against your real profile rewrites cookies (including `cf_clearance` /
+`__cf_bm`) and rotates state, which makes a later v10/v11 check ambiguous — you
+can no longer tell whether a tag came from the build you are testing or from a
+previous run.
+
+**Snapshot first** if you are about to touch the real profile:
+
+```bash
+cp -a ~/.config/Claude ~/.config/Claude.bak-$(date -u +%Y%m%dT%H%M%SZ)
+# or, compressed:
+tar -C ~/.config -czf ~/claude-profile-$(date -u +%Y%m%dT%H%M%SZ).tar.gz Claude
+```
+
+**Better: never touch it.** Run every test launch against throwaway XDG dirs:
+
+```bash
+CDTEST=$(mktemp -d)
+XDG_CONFIG_HOME="$CDTEST/config" \
+XDG_CACHE_HOME="$CDTEST/cache" \
+XDG_DATA_HOME="$CDTEST/data" \
+  "$(nix build .#default --no-link --print-out-paths)"/bin/claude-desktop \
+    --enable-logging=stderr
+```
+
+Verified isolating: after a launch this way the real `~/.config/Claude/Cookies`
+is byte-identical (`sha256sum -c` passes, mtime unchanged) while
+`$CDTEST/config/Claude` is created and populated.
+
+Two practical notes. Use the store path rather than `./result` — any other
+`nix build` (a `.#checks.…` invocation, say) repoints that symlink and you will
+launch the wrong thing, or get exit 126. And a throwaway profile is logged out,
+so it is the right tool for testing startup, library resolution and the
+sandbox, but not for a v10/v11 check, which needs a real authenticated session.
+
 ## Known issues
 
 **`Failed to create file "/nix/store/…-mimeapps.list.XXXXXX": Read-only file

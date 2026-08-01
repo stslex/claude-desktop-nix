@@ -68,6 +68,19 @@ jobs:
           test -f ./result/lib/claude-desktop/chrome-sandbox
           test -f ./result/share/applications/com.anthropic.Claude.desktop
 
+      # Called out as its own step rather than left to `nix flake check`
+      # below, because this is the one regression that is silent and
+      # security-relevant: if a new upstream build shifts layout such that
+      # libsecret-1.so.0 no longer resolves from the RUNPATH, the package
+      # still builds and still runs, but the session token drops from a
+      # keyring-derived v11 key to v10 obfuscation. A version bump must fail
+      # loudly and by name here, not merely somewhere inside flake check.
+      - name: Guard - dlopen'd libraries still resolve from RUNPATH
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          nix build .#checks.x86_64-linux.dlopen-runpath -L
+
       - name: Run flake checks
         if: steps.bump.outputs.changed == 'true'
         run: |

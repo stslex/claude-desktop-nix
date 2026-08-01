@@ -312,6 +312,46 @@ stdenv.mkDerivation (finalAttrs: {
   passthru = {
     inherit (source) url;
     updateScript = ./update.sh;
+
+    # Consumed by checks.dlopen-runpath. Every entry is a soname the main
+    # executable dlopen()s (string-scanned out of the binary — the same list
+    # runtimeLibs is derived from), restricted to those whose absence
+    # *degrades silently* instead of crashing. That is precisely the class a
+    # green build cannot catch: dlopen returning NULL is a feature quietly
+    # switching itself off, not a link error.
+    #
+    # libsecret-1.so.0 is the one that matters most: lose it and os_crypt
+    # falls back from a keyring-derived v11 key to the hardcoded-password
+    # v10 path, i.e. the session token silently stops being protected while
+    # everything still appears to work.
+    #
+    # Deliberately NOT listed: libnotify.so.1 / libnotify.so.5. The binary
+    # probes several libnotify versions in turn and only needs one; nixpkgs
+    # ships .so.4. Asserting the others would fail for no reason.
+    dlopenSonames = [
+      "libsecret-1.so.0" # os_crypt keyring -> v11 vs v10
+      "libnotify.so.4" # desktop notifications
+      "libgdk_pixbuf-2.0.so.0" # image loading
+      "libpulse.so.0" # audio output
+      "libGL.so.1" # GPU compositing
+      "libEGL.so.1"
+      "libGLESv2.so.2"
+      "libvulkan.so.1" # Vulkan backend
+      "libva.so.2" # VA-API hardware video decode
+      "libva-drm.so.2"
+      "libpci.so.3" # GPU enumeration
+      "libgssapi_krb5.so.2" # SPNEGO / Negotiate auth
+      "libdbusmenu-glib.so.4" # tray menus
+      "libspeechd.so.2" # accessibility TTS
+      "libuuid.so.1"
+      "libXtst.so.6"
+      "libXcursor.so.1"
+      "libX11-xcb.so.1"
+      "libxcb-dri3.so.0"
+      "libxcb-glx.so.0"
+      "libxcb-present.so.0"
+      "libxcb-sync.so.1"
+    ];
   };
 
   meta = {
