@@ -201,8 +201,8 @@ soname named, rather than shipping a feature that silently does nothing; a bump
 that stops using one fails too, waivers included, so no entry can rot into an
 assertion that passes while testing nothing. It is a string scan, so it cannot
 see a soname assembled at runtime — `libva` is the live case, and why
-`passthru.dlopenSonamesRuntimeVersioned` declares `libva.so` as the spelling
-that stands for `libva.so.2`. Only those may substitute: the six entries in
+`passthru.dlopenSonamesRuntimeVersioned` declares — for the one object that
+does it — that `libva.so` stands for `libva.so.2`. Only those may substitute: the six entries in
 `dlopenSonamesSecondSpellings` are spellings the binary carries *beside* the
 exact soname, so they classify the string but never prove the exact one is
 still there. It reads ELF objects only, nothing inside `app.asar`. It resolves

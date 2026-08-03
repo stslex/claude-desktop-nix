@@ -26,7 +26,7 @@ under measurement, and now carries the evidence it should have had:
   which is exactly what makes them easy to confuse. The claim stands; the proof
   is now in D1.
 
-Nine further review rounds on the rewrite found fourteen more holes in the
+Ten further review rounds on the rewrite found fifteen more holes in the
 guard, all now closed and described in D3. Round two: `DT_NEEDED` was classified
 globally rather than per object, so one object could dlopen a soname only
 another object links with nothing checking it could reach it; and a waiver
@@ -64,7 +64,10 @@ open. The evidence is now an occurrence inside a `PT_LOAD` segment and outside
 `.dynstr` was located by section-header *name*, and ELF section headers are
 optional, so an object that hid them fell through to "no linkage table to
 exclude". It is derived from `PT_DYNAMIC`'s `DT_STRTAB`/`DT_STRSZ` now — what
-the loader itself reads.
+the loader itself reads. Round eleven scoped the last global table: the
+runtime-versioned spellings carried no object identity, so a *different* ELF
+naming `libva.so` as an ordinary literal would have had `libva.so.2` checked on
+its behalf.
 
 The D3 gap is separately closed: the workflow has since run in CI on a real
 bump. All of this is detailed in the sections below.
@@ -298,7 +301,7 @@ fresh scan of every ELF object in the output:
 | | Assertion | The regression it catches |
 | --- | --- | --- |
 | 1 | **RESOLVE** — every soname the package claims to provide resolves from the main executable's RUNPATH | the library leaves the closure, or the RUNPATH stops reaching it |
-| 1b | **REACHABILITY** — *every* (object, soname) pair the scan produced resolves from that object's own RUNPATH — resolving what the loader is actually asked for, which for a runtime-versioned spelling is the mapped soname rather than the string in the binary, and for a second spelling is the literal unless *this same object* carries the exact soname where a call could reach it — inside a `PT_LOAD` segment and outside the dynamic string table located through `PT_DYNAMIC`, rather than in linkage metadata or in a section that is never mapped — exempting only the object's own `DT_SONAME`, its **own** `DT_NEEDED`, and sonames waived **for that object** | object A dlopening something only object B links, or something waived only because B probes for it. Both `DT_NEEDED` and a waiver are per-object facts; a global union of either vouches for A on B's evidence |
+| 1b | **REACHABILITY** — *every* (object, soname) pair the scan produced resolves from that object's own RUNPATH — resolving what the loader is actually asked for, which for a spelling the *naming object* is declared to compose at runtime is the mapped soname rather than the string in the binary, and for a second spelling is the literal unless *this same object* carries the exact soname where a call could reach it — inside a `PT_LOAD` segment and outside the dynamic string table located through `PT_DYNAMIC`, rather than in linkage metadata or in a section that is never mapped — exempting only the object's own `DT_SONAME`, its **own** `DT_NEEDED`, and sonames waived **for that object** | object A dlopening something only object B links, or something waived only because B probes for it. Both `DT_NEEDED` and a waiver are per-object facts; a global union of either vouches for A on B's evidence |
 | 2 | **REFERENCE** — every soname the lists mention is still named by the payload: provided sonames anywhere, waivers by the object they were written for, declared aliases anywhere | upstream drops a dlopen and the entry becomes an assertion that passes forever while testing nothing; or a waiver or alias goes stale and silently pre-approves a soname that later comes back for something that matters |
 | 3 | **NOVELTY** — every soname-shaped string in the payload is accounted for: `DT_NEEDED`, bundled with the app, provided by us, or waived by name with a reason | upstream *adds* a dlopen — which the others cannot see at all |
 
@@ -410,12 +413,15 @@ dlopenSonamesUnprovided = {
   ];
 };
 
-# The versioned string never appears; the binary appends the ABI version
-# at runtime. The unversioned form is the only evidence there is, so it
-# *does* stand in for an exact reference.
+# Keyed by the object that composes the version at runtime: there the
+# versioned string never appears, so the unversioned form is the only
+# evidence there is and *does* stand in for an exact reference. Another
+# object naming the same string is asking for that exact file.
 dlopenSonamesRuntimeVersioned = {
-  "libva.so" = "libva.so.2";
-  "libva-drm.so" = "libva-drm.so.2";
+  "lib/claude-desktop/claude-desktop" = {
+    "libva.so" = "libva.so.2";
+    "libva-drm.so" = "libva-drm.so.2";
+  };
 };
 
 # Spellings the payload carries *in addition to* the exact soname. They
@@ -807,7 +813,26 @@ the object itself — `resources/cowork-linux-helper` is exactly that kind of
 binary today, and it names no sonames at all, so nothing about it needs
 reporting.
 
-All seventeen print the same guidance block before exiting, which names the fix
+**A SUBSTITUTION APPLIED TO AN OBJECT THAT NEVER EARNED IT.** `libva.so`
+standing for `libva.so.2` is true of the main executable, which appends the ABI
+version at runtime. It is not a property of the string. A second object naming
+`libva.so` as an ordinary `dlopen` literal, on a RUNPATH holding only
+`libva.so.2` — which is what a runtime output normally carries, the unversioned
+symlink living in `dev`:
+
+```
+round-10 check (global map)               round-11 check (scoped to the declarer)
+  (no finding)                              FAIL  libva.so  named by lib/…/libvaprobe.so,
+                                                  unresolvable from its RUNPATH
+```
+
+`dlopenSonamesRuntimeVersioned` is keyed by object now, and the staleness
+assertion asks whether *that* object still names the spelling. Second spellings
+keep a payload-wide table, because their substitution is already gated per
+object by the literal test — declaring what is verified would add bookkeeping
+without adding a guarantee.
+
+All eighteen print the same guidance block before exiting, which names the fix
 for each failure mode:
 
 ```

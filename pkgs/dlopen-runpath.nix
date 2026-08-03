@@ -85,10 +85,14 @@ runCommand "claude-desktop-dlopen-runpath"
         ) claude-desktop.dlopenSonamesUnprovided
       )
     );
-    # "<spelling>\t<soname it stands for>" per line, in two tables: only the
-    # runtime-versioned one may stand in for an exact reference.
+    # "<object>\t<spelling>\t<soname it stands for>" per line: which object
+    # composes the ABI version at runtime, and for which spelling.
     runtimeVersioned = lib.concatStringsSep "\n" (
-      lib.mapAttrsToList (a: t: "${a}\t${t}") claude-desktop.dlopenSonamesRuntimeVersioned
+      lib.concatLists (
+        lib.mapAttrsToList (
+          obj: m: lib.mapAttrsToList (a: t: "${obj}\t${a}\t${t}") m
+        ) claude-desktop.dlopenSonamesRuntimeVersioned
+      )
     );
     secondSpellings = lib.concatStringsSep "\n" (
       lib.mapAttrsToList (a: t: "${a}\t${t}") claude-desktop.dlopenSonamesSecondSpellings
@@ -112,9 +116,18 @@ runCommand "claude-desktop-dlopen-runpath"
     # string genuinely does not exist. A second spelling that sits beside the
     # exact string proves nothing about it — if the exact string disappears,
     # that is the news the reference assertion exists to report.
-    declare -A ALIAS=() SUBST=()
-    while IFS=$'\t' read -r a t; do
-      if [ -n "$a" ]; then
+    # RTV["<object>\t<spelling>"] — this object composes the version itself,
+    # so what it opens is the mapped soname and the literal never appears.
+    # Object-scoped for the same reason waivers are: another ELF naming the
+    # same string is asking for that exact file.
+    # SUBST is the payload-wide view of the same table, used only where the
+    # question is payload-wide ("is this soname still named anywhere").
+    declare -A ALIAS=() SUBST=() RTV=()
+    rtvPairs=()
+    while IFS=$'\t' read -r obj a t; do
+      if [ -n "$obj" ]; then
+        RTV["$obj"$'\t'"$a"]=$t
+        rtvPairs+=("$obj"$'\t'"$a")
         ALIAS["$a"]=$t
         SUBST["$a"]=$t
       fi
@@ -432,10 +445,10 @@ runCommand "claude-desktop-dlopen-runpath"
         # there. For everything else the literal is what gets opened, with the
         # mapped soname accepted as a fallback for second spellings, which the
         # binary tries alongside the exact name.
-        if [ -n "''${SUBST[$s]-}" ]; then
-          if ! resolveIn "$rel" "''${SUBST[$s]}" >/dev/null; then
+        if [ -n "''${RTV[$rel$'\t'$s]-}" ]; then
+          if ! resolveIn "$rel" "''${RTV[$rel$'\t'$s]}" >/dev/null; then
             printf '  FAIL    %-26s named by %s; its runtime soname %s is unresolvable from that RUNPATH\n' \
-              "$s" "$rel" "''${SUBST[$s]}"
+              "$s" "$rel" "''${RTV[$rel$'\t'$s]}"
             rc=1
           fi
         elif ! resolveIn "$rel" "$s" >/dev/null; then
@@ -512,14 +525,22 @@ runCommand "claude-desktop-dlopen-runpath"
     # The spelling tables are assertions too: an entry nothing names is a rule
     # about a string that no longer exists.
     echo
-    echo "== reference: declared spellings are still named by the payload"
+    echo "== reference: declared spellings are still named"
+    for pair in "''${rtvPairs[@]}"; do
+      obj=''${pair%%$'\t'*}
+      a=''${pair#*$'\t'}
+      if namesIt "$obj" "$a"; then
+        printf '  ok      %-26s stands for %s in %s (version appended at runtime)\n' \
+          "$a" "''${RTV[$pair]}" "$obj"
+      else
+        printf '  FAIL    %-26s stale spelling: %s no longer names it\n' "$a" "$obj"
+        rc=1
+      fi
+    done
     for a in $(printf '%s\n' "''${!ALIAS[@]}" | sort); do
+      if [ -n "''${SUBST[$a]-}" ]; then continue; fi
       if [ -n "''${SCANNED[$a]-}" ]; then
-        if [ -n "''${SUBST[$a]-}" ]; then
-          printf '  ok      %-26s stands for %s (version appended at runtime)\n' "$a" "''${ALIAS[$a]}"
-        else
-          printf '  ok      %-26s stands for %s (second spelling)\n' "$a" "''${ALIAS[$a]}"
-        fi
+        printf '  ok      %-26s stands for %s (second spelling)\n' "$a" "''${ALIAS[$a]}"
       else
         printf '  FAIL    %-26s stale spelling: no longer named by any shipped ELF\n' "$a"
         rc=1

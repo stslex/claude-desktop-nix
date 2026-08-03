@@ -437,9 +437,15 @@ stdenv.mkDerivation (finalAttrs: {
     # string when the guard asks "is this soname still named". Verified at
     # 1.24012.9: neither libva.so.2 nor libva-drm.so.2 appears in any shipped
     # ELF, while both unversioned forms do.
+    # Keyed by the object that composes the version, because that is a claim
+    # about one binary's behaviour: another ELF naming "libva.so" as an
+    # ordinary dlopen literal is asking for that exact file, and the runtime
+    # output need not carry the unversioned development symlink.
     dlopenSonamesRuntimeVersioned = {
-      "libva.so" = "libva.so.2";
-      "libva-drm.so" = "libva-drm.so.2";
+      "lib/claude-desktop/claude-desktop" = {
+        "libva.so" = "libva.so.2";
+        "libva-drm.so" = "libva-drm.so.2";
+      };
     };
 
     # Unversioned spellings the payload carries *in addition to* the exact
