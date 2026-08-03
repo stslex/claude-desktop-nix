@@ -26,13 +26,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Paired with `base: dev` on the PR step below, and only correct as a
+          # pair. create-pull-request branches from `base`, not from whatever
+          # is checked out here, so these two decide different things: `base`
+          # picks the branch the bump lands on, this picks the tree the build
+          # and the guards run against. A scheduled run defaults to the
+          # repository's default branch (main), so changing `base` alone would
+          # verify main's tree and then open the PR against dev — the contract
+          # at the top of this file would still be enforced, just against a
+          # tree the PR does not modify.
+          #
+          # A manual dispatch uses the ref it was dispatched from instead, so
+          # the updater can be exercised end to end from a branch before that
+          # branch is merged.
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || 'dev' }}
 
       - uses: DeterminateSystems/nix-installer-action@main
         with:
           extra-conf: |
             experimental-features = nix-command flakes
 
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      # No binary cache step here on purpose. Magic Nix Cache was retired in
+      # February 2025 and its successor (FlakeHub Cache) needs a FlakeHub
+      # account plus `id-token: write`; until someone wants to own that
+      # credential, no cache is better than one that fails auth on every run.
 
       # The runner's disk is tight: the .deb is ~160 MB and the unpacked
       # derivation is ~500 MB, plus the whole GTK/NSS closure.
@@ -89,10 +107,10 @@ jobs:
 
       - name: Open pull request
         if: steps.bump.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: update/claude-desktop-${{ steps.bump.outputs.version }}
-          base: main
+          base: dev
           commit-message: "claude-desktop: ${{ steps.bump.outputs.version }}"
           title: "claude-desktop: ${{ steps.bump.outputs.version }}"
           delete-branch: true
