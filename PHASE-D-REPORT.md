@@ -26,7 +26,7 @@ under measurement, and now carries the evidence it should have had:
   which is exactly what makes them easy to confuse. The claim stands; the proof
   is now in D1.
 
-Thirteen further review rounds on the rewrite found eighteen more holes in the
+Fourteen further review rounds on the rewrite found nineteen more holes in the
 guard, all now closed and described in D3. Round two: `DT_NEEDED` was classified
 globally rather than per object, so one object could dlopen a soname only
 another object links with nothing checking it could reach it; and a waiver
@@ -75,7 +75,10 @@ thirteen applied the same rule to a runtime-versioned declaration, which was
 honoured and kept alive on any occurrence of the prefix at all, including one
 surviving only in debug metadata; round fourteen applied it to the plainest
 path of the lot, the provided sonames themselves, whose reference assertion was
-still satisfied by a bare scan hit.
+still satisfied by a bare scan hit. Round fifteen closed the last soname-only
+path anywhere in the guard: novelty classified a waived soname payload-wide, so
+a second object naming it — and able to resolve it — needed no decision, which
+is exactly what the per-object waiver contract promises it will demand.
 
 The D3 gap is separately closed: the workflow has since run in CI on a real
 bump. All of this is detailed in the sections below.
@@ -907,7 +910,29 @@ payload-wide direction. All twenty-two provided entries and all six second
 spellings pass it unchanged, which is the point — they are genuine `.rodata`
 probe literals, and the rule exists to require that they stay so.
 
-All twenty-one print the same guidance block before exiting, which names the fix
+**THE LAST SONAME-ONLY PATH.** Reachability had been per object since round
+three, but novelty still marked a waived soname known for the whole payload. A
+second object naming it, able to resolve it from its own RUNPATH, therefore
+passed both: reachability because it resolves, novelty because someone else's
+waiver classified the string.
+
+```
+round-14 check                              round-15 check
+  ok  all 94 classified                       FAIL  libsoda.so  unclassified for
+      (DT_NEEDED, bundled, provided,                lib/…/libsecond.so
+       waived, or a declared spelling)
+```
+
+Waivers are classified by `(object, soname)` now. `DT_NEEDED` deliberately stays
+payload-wide there: a linked soname is one the build resolved and the closure
+carries, and reachability has already made the naming object prove it can reach
+it — whereas a waiver says the library is deliberately absent, which is a claim
+about the object that probes for it.
+
+That is every assertion and every table on the same footing: per object where
+the fact is per object, payload-wide where it genuinely is.
+
+All twenty-two print the same guidance block before exiting, which names the fix
 for each failure mode:
 
 ```

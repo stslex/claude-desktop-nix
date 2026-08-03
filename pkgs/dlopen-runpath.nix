@@ -587,27 +587,36 @@ runCommand "claude-desktop-dlopen-runpath"
     # -------------------------------------------------------- 3. NOVELTY
     echo
     echo "== novelty: every soname string is classified"
+    # Payload-wide reasons only. A DT_NEEDED soname anywhere is one the build
+    # resolved and the closure carries, so another object naming it needs no
+    # decision — reachability already made it prove it can reach it. A waiver
+    # is the opposite: it says this package deliberately does *not* provide the
+    # library, which is a statement about the object that probes for it, so it
+    # is checked per (object, soname) below.
     declare -A KNOWN=()
     for s in $provided $dependsOnly "''${!NEEDED[@]}" "''${!BUNDLED[@]}" "''${!ALIAS[@]}"; do
       KNOWN["$s"]=1
-    done
-    for pair in "''${waiverPairs[@]}"; do
-      KNOWN["''${pair#*$'\t'}"]=1
     done
 
     unknown=()
     for s in "''${!SCANNED[@]}"; do
       if [ -n "''${KNOWN[$s]-}" ]; then continue; fi
-      unknown+=("$s")
+      while IFS= read -r rel; do
+        if [ -z "$rel" ]; then continue; fi
+        if [ -n "''${WAIVED[$rel$'\t'$s]-}" ]; then continue; fi
+        unknown+=("$rel"$'\t'"$s")
+      done <<< "''${SEENIN[$s]-}"
     done
 
     if [ ''${#unknown[@]} -eq 0 ]; then
-      echo "  ok      all ''${#SCANNED[@]} classified (DT_NEEDED, bundled, provided, waived, or a declared spelling)"
+      echo "  ok      all ''${#SCANNED[@]} classified (DT_NEEDED, bundled, provided, a declared spelling, or waived for the object naming it)"
     else
-      for s in $(printf '%s\n' "''${unknown[@]}" | sort); do
-        printf '  FAIL    %-26s unclassified, named by %s\n' "$s" "''${SEENIN[$s]%%$'\n'*}"
+      # read, not a $(...) loop: the pairs are tab-separated and word
+      # splitting would tear them in half.
+      while IFS= read -r pair; do
+        printf '  FAIL    %-26s unclassified for %s\n' "''${pair#*$'\t'}" "''${pair%%$'\t'*}"
         rc=1
-      done
+      done < <(printf '%s\n' "''${unknown[@]}" | sort)
     fi
 
     if [ $rc -ne 0 ]; then
@@ -638,11 +647,13 @@ runCommand "claude-desktop-dlopen-runpath"
                        would silently pre-approve the soname if a later
                        release brings it back for something that matters.
 
-      unclassified     upstream started naming something new. Decide which it
-                       is: add it to runtimeLibs + dlopenSonames if this
-                       package should provide it, or to
-                       dlopenSonamesUnprovided with the reason if it should
-                       not.
+      unclassified     that object started naming something nothing accounts
+                       for. Decide which it is: add it to runtimeLibs +
+                       dlopenSonames if this package should provide it, or to
+                       that object's list in dlopenSonamesUnprovided with the
+                       reason if it should not. A waiver written for a
+                       different object does not carry over — the second one
+                       naming it is a second decision.
     MSG
       exit 1
     fi
