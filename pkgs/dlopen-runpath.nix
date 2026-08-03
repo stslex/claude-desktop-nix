@@ -369,7 +369,7 @@ runCommand "claude-desktop-dlopen-runpath"
     done
 
     if [ ''${#unknown[@]} -eq 0 ]; then
-      echo "  ok      all ''${#SCANNED[@]} classified (DT_NEEDED, bundled, provided, waived, or a declared alias)"
+      echo "  ok      all ''${#SCANNED[@]} classified (DT_NEEDED, bundled, provided, waived, or a declared spelling)"
     else
       for s in $(printf '%s\n' "''${unknown[@]}" | sort); do
         printf '  FAIL    %-26s unclassified, named by %s\n' "$s" "''${SEENIN[$s]%% *}"

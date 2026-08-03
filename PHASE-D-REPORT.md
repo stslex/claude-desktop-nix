@@ -683,7 +683,7 @@ scanned 14 ELF objects, 93 distinct soname strings
   [6 further ok lines elided]
 
 == novelty: every soname string is classified
-  ok      all 93 classified (DT_NEEDED, bundled, provided, waived, or a declared alias)
+  ok      all 93 classified (DT_NEEDED, bundled, provided, waived, or a declared spelling)
 ```
 
 24/24 resolve, 37 (object, soname) pairs reachable, 22/22 provided sonames,
@@ -717,8 +717,9 @@ remote, so "a bump fails loudly" rested entirely on a local exit code plus
 Actions' documented gating semantics. **That is closed.** The repo has a remote,
 and the updater has now run end to end on a real bump once per revision of the
 guard — `30801047214` (pre-review), `30804260785` (first rewrite),
-`30805384864` (per-object `DT_NEEDED`) and `30806151997` (object-scoped
-waivers and the alias table, i.e. what is in the tree). Each was a
+`30805384864` (per-object `DT_NEEDED`), `30806151997` (object-scoped waivers
+and the spelling table) and `30806981647` (the spelling split and `$ORIGIN`
+expansion, i.e. what is in the tree). Each was a
 `workflow_dispatch` from a branch with `sources.json` pinned one release back,
 which is the only way to exercise the bump path on demand — without a pin there
 is nothing to bump and every gated step skips. The last one:
@@ -734,9 +735,9 @@ Guard - dlopen'd libraries still resolve from RUNPATH
                        claude-desktop-dlopen-runpath>   ok  37 (object, soname) pairs resolve; 113 exempt
                        claude-desktop-dlopen-runpath> == reference: provided sonames are still named by the payload
                        claude-desktop-dlopen-runpath> == reference: waivers are still named by the object they were written for
-                       claude-desktop-dlopen-runpath> == reference: declared aliases are still named by the payload
+                       claude-desktop-dlopen-runpath> == reference: declared spellings are still named by the payload
                        claude-desktop-dlopen-runpath> == novelty: every soname string is classified
-                       claude-desktop-dlopen-runpath>   ok  all 93 classified (DT_NEEDED, bundled, provided, waived, or a declared alias)
+                       claude-desktop-dlopen-runpath>   ok  all 93 classified (DT_NEEDED, bundled, provided, waived, or a declared spelling)
 Run flake checks       success
 Open pull request      pull-request-operation = none
 ```
@@ -934,7 +935,7 @@ got a response.
 9. ~~**`PHASE-D-REPORT.md` is untracked**~~ **Closed** by `bc1b793`, which
    committed this file (sanitized) as part of PR #1.
 10. ~~**The rewritten D3 guard has not itself run in CI yet.**~~ **Closed** by
-    run `30806151997`: the version now in the tree ran on a real bump on a
+    run `30806981647`: the version now in the tree ran on a real bump on a
     clean runner and passed, reporting the same 37 reachable pairs and 93
     classified sonames as it does locally. What has still never been observed
     in CI is the guard *failing* — see the D3 gap section for which parts of
