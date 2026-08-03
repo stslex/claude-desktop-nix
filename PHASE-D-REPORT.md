@@ -26,6 +26,13 @@ under measurement, and now carries the evidence it should have had:
   which is exactly what makes them easy to confuse. The claim stands; the proof
   is now in D1.
 
+A **second review round** on the rewrite found two more holes in the guard,
+both now closed and described in D3: `DT_NEEDED` was being classified globally
+rather than per object, so one object could dlopen a soname only another object
+links with nothing checking it could reach it; and a waiver could outlive the
+string that justified it, silently pre-approving that soname if a later release
+brought it back.
+
 The D3 gap is separately closed: the workflow has since run in CI on a real
 bump. All of this is detailed in the sections below.
 
@@ -257,14 +264,27 @@ fresh scan of every ELF object in the output:
 
 | | Assertion | The regression it catches |
 | --- | --- | --- |
-| 1 | **RESOLVE** — every soname the package claims to provide resolves from the main executable's RUNPATH, and from the RUNPATH of every other shipped object that names it | the library leaves the closure, or the RUNPATH stops reaching it |
-| 2 | **REFERENCE** — every soname it claims to provide is still named by the payload | upstream drops a dlopen; the list entry becomes an assertion that passes forever while testing nothing |
-| 3 | **NOVELTY** — every soname-shaped string in the payload is accounted for: `DT_NEEDED`, bundled with the app, provided by us, or waived by name with a reason | upstream *adds* a dlopen — which (1) and (2) cannot see at all |
+| 1 | **RESOLVE** — every soname the package claims to provide resolves from the main executable's RUNPATH | the library leaves the closure, or the RUNPATH stops reaching it |
+| 1b | **REACHABILITY** — *every* (object, soname) pair the scan produced resolves from that object's own RUNPATH, exempting only the object's own `DT_SONAME`, its **own** `DT_NEEDED`, and deliberately unprovided sonames | object A dlopening something only object B links. `DT_NEEDED` is a per-object fact; a global union of it silently vouches for A on B's evidence |
+| 2 | **REFERENCE** — every soname the lists mention is still named by the payload, waivers included | upstream drops a dlopen and the entry becomes an assertion that passes forever while testing nothing; or a waiver goes stale and silently pre-approves a soname that later comes back for something that matters |
+| 3 | **NOVELTY** — every soname-shaped string in the payload is accounted for: `DT_NEEDED`, bundled with the app, provided by us, or waived by name with a reason | upstream *adds* a dlopen — which the others cannot see at all |
 
-Assertions (2) and (3) are what tie the lists to the binary. The original
-version had neither, which is why its "the two cannot drift" claim was wrong:
-`dlopenSonames` sitting next to `runtimeLibs` is a convention for the person
-editing the file, and conventions are exactly what an upstream bump ignores.
+Assertions (1b), (2) and (3) are what tie the lists to the binary. The original
+version had none of them, which is why its "the two cannot drift" claim was
+wrong: `dlopenSonames` sitting next to `runtimeLibs` is a convention for the
+person editing the file, and conventions are exactly what an upstream bump
+ignores. (1b) and the waiver half of (2) came out of the second review round —
+the first rewrite still classified `DT_NEEDED` globally and still let a waiver
+outlive the string that justified it.
+
+The exemptions in (1b) are each per-object for a reason. An ELF's own
+`DT_SONAME` appears in its own strings. A soname in *this* object's
+`DT_NEEDED` is already the build's problem — autopatchelf would have failed —
+and `libc` and friends resolve through the patched interpreter's own search
+path rather than any RUNPATH, so demanding a RUNPATH hit for them would fail
+on a correct package. "We chose not to provide it" is the only other answer
+that excuses a soname from resolving, which is why the waiver list feeds this
+assertion too.
 
 It is still deliberately static — sonames are resolved against RUNPATH entries
 rather than by launching the app. An Xvfb launch check would be strictly worse
@@ -384,8 +404,9 @@ every shipped ELF rather than the main executable alone.
 
 ### 3. Negative tests — one per assertion (verbatim)
 
-Each was produced by editing `pkgs/claude-desktop.nix`, running the check, and
-restoring the file from a backup. Exit codes were measured without a pipe.
+Each was produced by editing `pkgs/claude-desktop.nix` (or, for REACHABILITY,
+a copy of the built output), running the check, and restoring. Exit codes were
+measured without a pipe.
 
 **RESOLVE** — `libsecret` removed from `runtimeLibs`:
 
@@ -424,7 +445,38 @@ claude-desktop-dlopen-runpath>   FAIL    libsoda.so                 unclassified
 NOVELTY (a named soname left unclassified): nix build exit code = 1
 ```
 
-All three print the same guidance block before exiting, which names the fix for
+**REACHABILITY** — the second review round's case: an object naming a soname
+that only *another* object links. `libvk_swiftshader.so` names `libxcb.so.1`
+and does not have it in its own `DT_NEEDED`; the main executable does. Removing
+the libxcb entry from that one object's RUNPATH (17 → 16 entries) leaves every
+other assertion green and fails only this one:
+
+```
+  FAIL    libxcb.so.1                named by lib/claude-desktop/libvk_swiftshader.so, unresolvable from its RUNPATH
+  ok      36 (object, soname) pairs resolve; 114 exempt (own soname, that object's DT_NEEDED, or waived)
+
+exit code = 1
+```
+
+Note what stays silent: `libxcb.so.1` is not on the provided list, so RESOLVE
+never looks at it, and it is `DT_NEEDED` *somewhere*, so NOVELTY classifies it
+happily. Before this assertion existed the whole run was green. A store path
+cannot be mutated in place, so this one was produced by running the check's own
+`buildCommand` — extracted with `nix derivation show` — against a writable copy
+of the output with that single RUNPATH edited; the store path was left
+untouched and the copy deleted afterwards.
+
+**STALE WAIVER** — `libunity.so.42` added to `dlopenSonamesUnprovided`,
+standing in for a waiver upstream has stopped naming:
+
+```
+claude-desktop-dlopen-runpath> == reference: waivers are still named by the payload
+claude-desktop-dlopen-runpath>   FAIL    libunity.so.42             stale waiver: no longer named by any shipped ELF
+
+STALE WAIVER: nix build exit code = 1
+```
+
+All five print the same guidance block before exiting, which names the fix for
 each failure mode:
 
 ```
@@ -467,8 +519,8 @@ scanned 14 ELF objects, 93 distinct soname strings
   ok      libuuid.so.1               -> /nix/store/m4q3a226wx3qjd3yrmwv2q0rzsjqf5zg-util-linux-2.42.2-lib/lib
   ok      libXtst.so.6               -> /nix/store/sn84f2wa25q1f0qvq2c1x5sbr6gp8qgy-libxtst-1.2.5/lib
 
-== resolve: and from the RUNPATH of every other object that names them
-  ok      5 further (object, soname) pairs resolve
+== reachability: each named soname resolves from the RUNPATH of the object naming it
+  ok      36 (object, soname) pairs resolve; 114 exempt (own soname, that object's DT_NEEDED, or waived)
 
 == reference: provided sonames are still named by the payload
   ok      libsecret-1.so.0           named by lib/claude-desktop/claude-desktop
@@ -480,12 +532,18 @@ scanned 14 ELF objects, 93 distinct soname strings
   n/a     libuuid.so.1               Depends-only, not expected in the scan
   n/a     libXtst.so.6               Depends-only, not expected in the scan
 
+== reference: waivers are still named by the payload
+  ok      libnotify.so.1             still named
+  ok      libgssapi.so.1             still named
+  [23 further ok lines elided]
+
 == novelty: every soname string is classified
   ok      all 93 classified (DT_NEEDED, bundled, provided or waived)
 ```
 
-24/24 resolve, 22/22 still referenced, 93/93 classified. `nix flake check`
-passes with both checks built.
+24/24 resolve, 36 (object, soname) pairs reachable, 22/22 provided sonames and
+25/25 waivers still named, 93/93 classified. `nix flake check` passes with both
+checks built.
 
 ### 5. Where it is wired into the updater
 

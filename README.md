@@ -185,16 +185,21 @@ and KVM plumbing is out of scope.
 
 **How this list is kept honest across upstream bumps.**
 `checks.dlopen-runpath` re-derives the picture from the binary on every run
-instead of trusting the hand-written list: it scans every shipped ELF for
+instead of trusting the hand-written list. It scans every shipped ELF for
 soname-shaped strings, then requires each string to be accounted for as
 `DT_NEEDED`, bundled with the app, provided by us (`passthru.dlopenSonames`),
-or waived by name with a reason (`passthru.dlopenSonamesUnprovided`). A bump
-that starts `dlopen`ing something new fails the check with that soname named,
-rather than shipping a feature that silently does nothing; a bump that stops
-using one fails too, so entries cannot rot into assertions that pass while
-testing nothing. It is a string scan, so it cannot see a soname assembled at
-runtime — `libva` is the live case, and why an unversioned stem such as
-`libva.so` counts as a reference for `libva.so.2`.
+or waived by name with a reason (`passthru.dlopenSonamesUnprovided`) — and
+requires every `(object, soname)` pair to resolve from *that object's* RUNPATH,
+not merely from the main executable's. Being `DT_NEEDED` of one object says
+nothing about whether another can reach it.
+
+So a bump that starts `dlopen`ing something new fails the check with that
+soname named, rather than shipping a feature that silently does nothing; a bump
+that stops using one fails too, waivers included, so no entry can rot into an
+assertion that passes while testing nothing. It is a string scan, so it cannot
+see a soname assembled at runtime — `libva` is the live case, and why an
+unversioned stem such as `libva.so` counts as a reference for `libva.so.2` —
+and it reads ELF objects only, nothing inside `app.asar`.
 
 ## Updating
 
