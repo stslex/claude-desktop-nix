@@ -1017,8 +1017,9 @@ that fallback), `30809133986` (that exclusion decided by offset rather than by
 name), `30809740850` (evidence narrowed to mapped segments), `30810420891`
 (the string table located through `PT_DYNAMIC`), `30810940553`
 (runtime-versioned spellings scoped to the composing object), `30811371458`
-(waiver inheritance gated on literal evidence) and `30811830842` (the
-runtime-versioned declaration gated on the same, i.e. what is in the tree). Each was a
+(waiver inheritance gated on literal evidence), `30811830842` (the
+runtime-versioned declaration gated on the same) and `30812424880` (the provided
+references too, i.e. what is in the tree). Each was a
 `workflow_dispatch` from a branch with `sources.json` pinned one release back,
 which is the only way to exercise the bump path on demand — without a pin there
 is nothing to bump and every gated step skips. The last one:
@@ -1234,7 +1235,7 @@ got a response.
 9. ~~**`PHASE-D-REPORT.md` is untracked**~~ **Closed** by `bc1b793`, which
    committed this file (sanitized) as part of PR #1.
 10. ~~**The rewritten D3 guard has not itself run in CI yet.**~~ **Closed** by
-    run `30811830842`: the version now in the tree ran on a real bump on a
+    run `30812424880`: the version now in the tree ran on a real bump on a
     clean runner and passed, reporting the same 37 reachable pairs and 93
     classified sonames as it does locally. What has still never been observed
     in CI is the guard *failing* — see the D3 gap section for which parts of
