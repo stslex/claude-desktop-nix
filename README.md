@@ -20,7 +20,7 @@ $ nix run github:<you>/claude-desktop-nix
 | `packages.claude-desktop-fhs` | Same app inside a `buildFHSEnv` that provides `npx`, `uvx`, `docker`, `git`, `python3` at conventional FHS paths, so published MCP server configs work unmodified. |
 | `overlays.default` | Adds `claude-desktop` and `claude-desktop-fhs` to a nixpkgs instance. |
 | `checks.wrapper-flags` | Asserts the wrapper keeps its flags, never gains `--no-sandbox`, ships `chrome-sandbox`, and has a valid desktop entry with rewritten `Exec=` lines. |
-| `checks.dlopen-runpath` | Scans every shipped ELF for soname strings and asserts three things: the libraries this package provides still resolve from RUNPATH, they are still named by the payload, and nothing *new* is named that hasn't been classified. See [Dependency provenance](#dependency-provenance). |
+| `checks.dlopen-runpath` | Scans every shipped ELF for soname strings and asserts that each library this package provides resolves from the RUNPATH of every object naming it, that nothing on the lists has stopped being named, and that nothing *new* is named without being classified. See [Dependency provenance](#dependency-provenance). |
 
 ### NixOS
 
