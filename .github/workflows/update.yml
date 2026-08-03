@@ -32,7 +32,10 @@ jobs:
           extra-conf: |
             experimental-features = nix-command flakes
 
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      # No binary cache step here on purpose. Magic Nix Cache was retired in
+      # February 2025 and its successor (FlakeHub Cache) needs a FlakeHub
+      # account plus `id-token: write`; until someone wants to own that
+      # credential, no cache is better than one that fails auth on every run.
 
       # The runner's disk is tight: the .deb is ~160 MB and the unpacked
       # derivation is ~500 MB, plus the whole GTK/NSS closure.
