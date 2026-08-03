@@ -570,12 +570,13 @@ checks built.
 The original gap was that the workflow had never executed: the repo had no git
 remote, so "a bump fails loudly" rested entirely on a local exit code plus
 Actions' documented gating semantics. **That is closed.** The repo has a remote,
-and the updater has now run end to end on a real bump twice — run
-`30801047214` against the pre-review guard, and run `30804260785` against the
-rewritten one. Both were `workflow_dispatch` runs from a branch with
-`sources.json` pinned one release back, which is the only way to exercise the
-bump path on demand (without a pin there is nothing to bump and every gated
-step skips). The second one:
+and the updater has now run end to end on a real bump three times — run
+`30801047214` against the pre-review guard, `30804260785` against the first
+rewrite, and `30805384864` against the four-assertion version that is in the
+tree. All three were `workflow_dispatch` runs from a branch with `sources.json`
+pinned one release back, which is the only way to exercise the bump path on
+demand (without a pin there is nothing to bump and every gated step skips).
+The last one:
 
 ```
 Bump sources.json      version=1.24012.9
@@ -584,10 +585,12 @@ Build the new version  success
 Guard - dlopen'd libraries still resolve from RUNPATH
                        claude-desktop-dlopen-runpath> scanned 14 ELF objects, 93 distinct soname strings
                        claude-desktop-dlopen-runpath> == resolve: provided sonames, from the main executable's RUNPATH
-                       claude-desktop-dlopen-runpath>   ok  libsecret-1.so.0  -> …-libsecret-0.21.7/lib
-                       claude-desktop-dlopen-runpath>   ok  libgdk-3.so.0     -> …-gtk+3-3.24.52/lib
-                       claude-desktop-dlopen-runpath>   ok  libnssckbi.so     -> …-nss-3.112.5/lib
-                       (all three assertion blocks green)
+                       claude-desktop-dlopen-runpath> == reachability: each named soname resolves from the RUNPATH of the object naming it
+                       claude-desktop-dlopen-runpath>   ok  36 (object, soname) pairs resolve; 114 exempt
+                       claude-desktop-dlopen-runpath> == reference: provided sonames are still named by the payload
+                       claude-desktop-dlopen-runpath> == reference: waivers are still named by the payload
+                       claude-desktop-dlopen-runpath> == novelty: every soname string is classified
+                       claude-desktop-dlopen-runpath>   ok  all 93 classified (DT_NEEDED, bundled, provided or waived)
 Run flake checks       success
 Open pull request      pull-request-operation = none
 ```
@@ -785,10 +788,11 @@ got a response.
 9. ~~**`PHASE-D-REPORT.md` is untracked**~~ **Closed** by `bc1b793`, which
    committed this file (sanitized) as part of PR #1.
 10. ~~**The rewritten D3 guard has not itself run in CI yet.**~~ **Closed** by
-    run `30804260785`: the three-assertion version ran on a real bump on a
-    clean runner and passed. What has still never been observed in CI is the
-    guard *failing* — see the D3 gap section for which parts of that are
-    measured and which are inferred.
+    run `30805384864`: the four-assertion version now in the tree ran on a real
+    bump on a clean runner and passed, reporting the same 36 reachable pairs
+    and 93 classified sonames as it does locally. What has still never been
+    observed in CI is the guard *failing* — see the D3 gap section for which
+    parts of that are measured and which are inferred.
 
 Phase C is **closed, not a gap**: you selected option 2 (one `/goal` per
 phase), so the proposed goal-text change was never needed and no hook config
