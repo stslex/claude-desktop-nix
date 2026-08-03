@@ -26,7 +26,7 @@ under measurement, and now carries the evidence it should have had:
   which is exactly what makes them easy to confuse. The claim stands; the proof
   is now in D1.
 
-Seven further review rounds on the rewrite found twelve more holes in the
+Eight further review rounds on the rewrite found thirteen more holes in the
 guard, all now closed and described in D3. Round two: `DT_NEEDED` was classified
 globally rather than per object, so one object could dlopen a soname only
 another object links with nothing checking it could reach it; and a waiver
@@ -55,9 +55,12 @@ scoping the fallback to the object was not enough, because an object's
 a string scan — linkage metadata was being read as evidence of a second
 `dlopen` attempt. Round eight then corrected the correction: subtracting those
 names outright was too blunt, since an ELF may legitimately link a soname *and*
-carry it as a literal fallback. The question is answered by byte offset now —
-does the name occur anywhere outside `.dynstr` — which is the thing actually
-being asked.
+carry it as a literal fallback. Round nine finished the thought — "outside
+`.dynstr`" is not the same as "reachable by a call", because `dontStrip = true`
+keeps `.comment`, `.shstrtab` and `.gnu_debuglink` in the file, and a soname
+sitting in one of those is a note about the binary rather than something it can
+open. The evidence is now an occurrence inside a `PT_LOAD` segment and outside
+`.dynstr`.
 
 The D3 gap is separately closed: the workflow has since run in CI on a real
 bump. All of this is detailed in the sections below.
@@ -291,7 +294,7 @@ fresh scan of every ELF object in the output:
 | | Assertion | The regression it catches |
 | --- | --- | --- |
 | 1 | **RESOLVE** — every soname the package claims to provide resolves from the main executable's RUNPATH | the library leaves the closure, or the RUNPATH stops reaching it |
-| 1b | **REACHABILITY** — *every* (object, soname) pair the scan produced resolves from that object's own RUNPATH — resolving what the loader is actually asked for, which for a runtime-versioned spelling is the mapped soname rather than the string in the binary, and for a second spelling is the literal unless *this same object* carries the exact soname as a string literal outside `.dynstr`, i.e. somewhere a `dlopen` call could pass it rather than only where the linker put it — exempting only the object's own `DT_SONAME`, its **own** `DT_NEEDED`, and sonames waived **for that object** | object A dlopening something only object B links, or something waived only because B probes for it. Both `DT_NEEDED` and a waiver are per-object facts; a global union of either vouches for A on B's evidence |
+| 1b | **REACHABILITY** — *every* (object, soname) pair the scan produced resolves from that object's own RUNPATH — resolving what the loader is actually asked for, which for a runtime-versioned spelling is the mapped soname rather than the string in the binary, and for a second spelling is the literal unless *this same object* carries the exact soname where a call could reach it — inside a `PT_LOAD` segment and outside `.dynstr`, rather than in linkage metadata or in a section that is never mapped — exempting only the object's own `DT_SONAME`, its **own** `DT_NEEDED`, and sonames waived **for that object** | object A dlopening something only object B links, or something waived only because B probes for it. Both `DT_NEEDED` and a waiver are per-object facts; a global union of either vouches for A on B's evidence |
 | 2 | **REFERENCE** — every soname the lists mention is still named by the payload: provided sonames anywhere, waivers by the object they were written for, declared aliases anywhere | upstream drops a dlopen and the entry becomes an assertion that passes forever while testing nothing; or a waiver or alias goes stale and silently pre-approves a soname that later comes back for something that matters |
 | 3 | **NOVELTY** — every soname-shaped string in the payload is accounted for: `DT_NEEDED`, bundled with the app, provided by us, or waived by name with a reason | upstream *adds* a dlopen — which the others cannot see at all |
 
@@ -722,6 +725,26 @@ round-7 check (subtracts names)            round-8 check (offset decides)
 `libboth.so` does try both spellings and works; `libonly.so` does not and is
 broken. Only the second is reported now, and round seven's finding is kept.
 
+Round nine then closed the remaining gap in that test: *outside `.dynstr`* is
+not the same as *reachable by a call*. This package sets `dontStrip = true`, so
+`.comment`, `.shstrtab` and `.gnu_debuglink` survive into the store path, and a
+soname appearing in one of them was being counted as a literal. A third object,
+`libmeta.so` — `libonly.so` plus the exact soname in a section marked
+`noload` — shows the difference:
+
+```
+  .fakemeta at file offset 0x3022
+  PT_LOAD:  0x000000+0x568  0x001000+0x111  0x002000+0xe8  0x002de8+0x228  0x004000+0x218
+                                                    ^ ends at 0x3010          ^ starts at 0x4000
+
+round-8 check (offset outside .dynstr)   round-9 check (and inside PT_LOAD)
+  FAIL  libnotify.so … libonly.so          FAIL  libnotify.so … libmeta.so
+                                           FAIL  libnotify.so … libonly.so
+```
+
+`libboth.so` is reported by neither, which is the point: three objects, three
+different kinds of occurrence, one verdict each.
+
 The original round-seven fixture, for the record — a shared object linked
 against the exact soname whose only string literal is the generic spelling, on
 a RUNPATH holding only the versioned file:
@@ -739,7 +762,7 @@ round-6 check                          round-7 check
 `dlopen` matches on the name it is asked for, so that call returns NULL however
 the object is linked.
 
-All fifteen print the same guidance block before exiting, which names the fix
+All sixteen print the same guidance block before exiting, which names the fix
 for each failure mode:
 
 ```

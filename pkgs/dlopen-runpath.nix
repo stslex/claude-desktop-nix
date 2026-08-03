@@ -192,12 +192,20 @@ runCommand "claude-desktop-dlopen-runpath"
         SEENIN["$s"]="''${SEENIN[$s]-}$rel"$'\n' 
       done < <(strings -a "$f" | grep -oE "$sonameRe" | sort -u)
 
-      # Second pass, by byte offset: which of those sonames occur somewhere
-      # *other* than .dynstr. An object's DT_NEEDED entries and its own
-      # DT_SONAME live in that section, so a name found only there is linkage
-      # metadata; the same name found in .rodata as well is a string literal
-      # some code path can pass to dlopen. Only the latter is evidence that
-      # this object tries that spelling itself.
+      # Second pass, by byte offset: which of those sonames could a dlopen call
+      # in *this* object actually pass. Two conditions, and both matter.
+      #
+      #   inside a PT_LOAD segment — a string a call site can reach has to be
+      #     mapped at runtime. dontStrip = true keeps .comment, .shstrtab,
+      #     .gnu_debuglink and friends in the file, and a soname sitting in one
+      #     of those is a note about the binary, not something it can open.
+      #   outside .dynstr — that section *is* loaded, but it is where the
+      #     linker records DT_NEEDED and DT_SONAME. A name found only there is
+      #     linkage metadata, not a call.
+      #
+      # Deciding this by offset rather than by subtracting DT_NEEDED names
+      # keeps the object that both links a soname and carries it as a literal
+      # fallback: that one really does try both spellings.
       dynOff=-1
       dynEnd=-1
       dynRange=$(readelf -SW "$f" 2>/dev/null \
@@ -208,14 +216,31 @@ runCommand "claude-desktop-dlopen-runpath"
         dynOff=$((16#$dynHexOff))
         dynEnd=$((dynOff + 16#$dynHexSize))
       fi
+
+      loadRanges=""
+      while read -r segOff segSize; do
+        if [ -n "$segOff" ]; then
+          loadRanges="$loadRanges $((segOff)):$(($segOff + $segSize))"
+        fi
+      done < <(readelf -lW "$f" 2>/dev/null | awk '$1 == "LOAD" { print $2, $5 }' || true)
+
       while IFS= read -r s; do
         LITERAL["$rel"]="''${LITERAL[$rel]-}$s"$'\n' 
       done < <(
         strings -a -t d "$f" \
-          | awk -v off="$dynOff" -v end="$dynEnd" '{
-              o = $1 + 0
-              if (off < 0 || o < off || o >= end) { $1 = ""; print }
-            }' \
+          | awk -v off="$dynOff" -v end="$dynEnd" -v ranges="$loadRanges" '
+              BEGIN {
+                n = split(ranges, r, " ")
+                for (i = 1; i <= n; i++) { split(r[i], p, ":"); lo[i] = p[1] + 0; hi[i] = p[2] + 0 }
+              }
+              {
+                o = $1 + 0
+                if (off >= 0 && o >= off && o < end) next
+                mapped = 0
+                for (i = 1; i <= n; i++) if (o >= lo[i] && o < hi[i]) { mapped = 1; break }
+                if (!mapped) next
+                $1 = ""; print
+              }' \
           | grep -oE "$sonameRe" | sort -u
       )
       while IFS= read -r n; do
