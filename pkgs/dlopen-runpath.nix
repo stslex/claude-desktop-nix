@@ -307,21 +307,13 @@ runCommand "claude-desktop-dlopen-runpath"
 
     echo "scanned ''${#elfs[@]} ELF objects, ''${#SCANNED[@]} distinct soname strings"
 
-    # Does this object name this exact string?
-    namesIt() { # $1 = object, $2 = soname
-      local r
-      while IFS= read -r r; do
-        if [ "$r" = "$1" ]; then return 0; fi
-      done <<< "''${SEENIN[$2]-}"
-      return 1
-    }
-
-    # Does this object look like it tries this exact spelling *itself*?
+    # Does this object look like it tries this exact spelling itself?
     #
-    # Stricter than namesIt, and the difference matters: an object's DT_NEEDED
-    # entries and its own DT_SONAME live in .dynstr, which is part of the file
-    # and therefore part of the string scan. A soname found only there is
-    # linkage metadata, not a dlopen attempt — and dlopen matches on the name
+    # Every assertion that asks "does this object ask for this soname" goes
+    # through here, and the distinction it draws is the one the whole guard
+    # turns on: an object's DT_NEEDED entries and its own DT_SONAME live in
+    # .dynstr, which is part of the file and therefore part of the string scan.
+    # A soname found only there is linkage metadata, not a dlopen attempt — and dlopen matches on the name
     # asked for, so a call to the generic spelling still returns NULL when
     # only the versioned file is on the RUNPATH, however the object is linked.
     #
@@ -562,7 +554,7 @@ runCommand "claude-desktop-dlopen-runpath"
       if triesItself "$1" "$2"; then return 0; fi
       local a
       for a in "''${!SUBST[@]}"; do
-        if [ "''${SUBST[$a]}" = "$2" ] && namesIt "$1" "$a"; then return 0; fi
+        if [ "''${SUBST[$a]}" = "$2" ] && triesItself "$1" "$a"; then return 0; fi
       done
       return 1
     }

@@ -962,6 +962,14 @@ still has to prove it can load it, because a declared soname is not a file.
                                       lib/…/resources/plugin.node
 ```
 
+**One found without being told.** After round sixteen came back clean, a sweep
+of the file for anything the sixteen incremental revisions had left behind
+turned up the last `namesIt` call, inside the waiver-staleness check: a waiver
+could still be kept alive by a runtime-versioned spelling that survived only in
+`.dynstr` or debug metadata. Converted to `triesItself` like everything else,
+and `namesIt` — with no callers left — is gone. Every assertion that asks "does
+this object ask for this soname" now goes through exactly one predicate.
+
 All twenty-four print the same guidance block before exiting, which names the
 fix for each failure mode:
 
