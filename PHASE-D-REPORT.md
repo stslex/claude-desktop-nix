@@ -26,7 +26,7 @@ under measurement, and now carries the evidence it should have had:
   which is exactly what makes them easy to confuse. The claim stands; the proof
   is now in D1.
 
-Three further review rounds on the rewrite found six more holes in the guard,
+Four further review rounds on the rewrite found eight more holes in the guard,
 all now closed and described in D3. Round two: `DT_NEEDED` was classified
 globally rather than per object, so one object could dlopen a soname only
 another object links with nothing checking it could reach it; and a waiver
@@ -40,7 +40,11 @@ spelling that sits *beside* an exact soname was still being accepted as proof
 that the exact one was still named, and `$ORIGIN` in a RUNPATH was tested as a
 literal directory rather than resolved against the object — the first would
 have let a waiver go stale unnoticed, the second would have failed a bump that
-works at runtime.
+works at runtime. Round five found two more of that second kind: a
+runtime-versioned spelling was resolved as the literal string the binary never
+opens, and the bundled-library inventory counted only regular files, so a
+library shipped the ordinary way — soname as a symlink onto a versioned file —
+would have been reported as an unclassified soname.
 
 The D3 gap is separately closed: the workflow has since run in CI on a real
 bump. All of this is detailed in the sections below.
@@ -274,7 +278,7 @@ fresh scan of every ELF object in the output:
 | | Assertion | The regression it catches |
 | --- | --- | --- |
 | 1 | **RESOLVE** — every soname the package claims to provide resolves from the main executable's RUNPATH | the library leaves the closure, or the RUNPATH stops reaching it |
-| 1b | **REACHABILITY** — *every* (object, soname) pair the scan produced resolves from that object's own RUNPATH, exempting only the object's own `DT_SONAME`, its **own** `DT_NEEDED`, and sonames waived **for that object** | object A dlopening something only object B links, or something waived only because B probes for it. Both `DT_NEEDED` and a waiver are per-object facts; a global union of either vouches for A on B's evidence |
+| 1b | **REACHABILITY** — *every* (object, soname) pair the scan produced resolves from that object's own RUNPATH — resolving what the loader is actually asked for, which for a runtime-versioned spelling is the mapped soname rather than the string in the binary — exempting only the object's own `DT_SONAME`, its **own** `DT_NEEDED`, and sonames waived **for that object** | object A dlopening something only object B links, or something waived only because B probes for it. Both `DT_NEEDED` and a waiver are per-object facts; a global union of either vouches for A on B's evidence |
 | 2 | **REFERENCE** — every soname the lists mention is still named by the payload: provided sonames anywhere, waivers by the object they were written for, declared aliases anywhere | upstream drops a dlopen and the entry becomes an assertion that passes forever while testing nothing; or a waiver or alias goes stale and silently pre-approves a soname that later comes back for something that matters |
 | 3 | **NOVELTY** — every soname-shaped string in the payload is accounted for: `DT_NEEDED`, bundled with the app, provided by us, or waived by name with a reason | upstream *adds* a dlopen — which the others cannot see at all |
 
@@ -616,7 +620,43 @@ FAIL: unsupported loader token in RUNPATH of lib/claude-desktop/libGLESv2.so: $O
       only $ORIGIN is modelled; teach resolveIn the rest before trusting this
 ```
 
-All nine print the same guidance block before exiting, which names the fix for
+The last two rounds turned up **false failures** rather than false passes —
+cases where the guard would have blocked a bump that works. Both were caught
+the same way, by running the previous revision of the check and the current one
+against the same doctored copy of the output.
+
+**RUNTIME-VERSIONED RESOLUTION.** nixpkgs routinely keeps the unversioned
+`libfoo.so` symlink in a package's `dev` output while the runtime library
+`libfoo.so.N` sits in the main one. Pointing the RUNPATH at a libva directory
+that carries only `libva.so.2` and `libva-drm.so.2` — no unversioned symlinks —
+is enough to show it:
+
+```
+round-4 check (resolves the literal)            round-5 check (resolves the mapped soname)
+  FAIL  libva.so      … unresolvable              ok  libva.so.2      named as libva.so
+  FAIL  libva-drm.so  … unresolvable              ok  libva-drm.so.2  named as libva-drm.so
+```
+
+The binary never opens `libva.so`; it appends the ABI version and opens
+`libva.so.2`, which was present the whole time. Second spellings keep resolving
+the literal, with the mapped soname as a fallback, because those the binary
+does try by both names.
+
+**BUNDLED SONAME SYMLINKS.** Shipping `libEGL.so -> libEGL.so.1.5.0` in the app
+directory is the ordinary way to ship a library, and `find -type f` records only
+the target, so the soname itself went missing from the bundled inventory:
+
+```
+round-4 check (-type f)                         round-5 check (-xtype f)
+  FAIL  libEGL.so  unclassified, named by …       ok  all 93 classified
+```
+
+It resolved fine — `[ -e ]` follows the link — it was only the classification
+that broke, which is enough to block the automated bump. `-xtype f` follows the
+link and tests the target, so a dangling symlink still does not count as
+bundled.
+
+All eleven print the same guidance block before exiting, which names the fix for
 each failure mode:
 
 ```

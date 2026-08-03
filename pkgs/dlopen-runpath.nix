@@ -154,15 +154,24 @@ runCommand "claude-desktop-dlopen-runpath"
     declare -A RPATH=() RPATHX=() SCANNED=() SEENIN=() NEEDED=() NEEDED_BY=() SONAME=() BUNDLED=()
     elfs=()
 
+    # -type f here (unlike the bundled inventory below): each real object is
+    # to be scanned once, and a soname symlink points at a file already in
+    # this list.
     while IFS= read -r f; do
       if [ "$(head -c4 "$f" 2>/dev/null | tr -d '\0' || true)" = $'\x7fELF' ]; then
         elfs+=("$f")
       fi
     done < <(find "$app" -type f | sort)
 
+    # -xtype f, not -type f: a bundled library is routinely shipped as
+    # libfoo.so.1 -> libfoo.so.1.2.3, and it is the *symlink* that carries the
+    # soname. Recording only regular files would leave that soname
+    # unclassified even though it resolves through the same directory. -xtype
+    # follows the link and tests the target, so a dangling one still does not
+    # count as bundled.
     while IFS= read -r f; do
       BUNDLED["$f"]=1
-    done < <(find "$app" -type f -name 'lib*.so*' -printf '%f\n' | grep -xE "$sonameRe" || true)
+    done < <(find "$app" -xtype f -name 'lib*.so*' -printf '%f\n' | grep -xE "$sonameRe" || true)
 
     for f in "''${elfs[@]}"; do
       rel=''${f#$app/}
@@ -273,7 +282,22 @@ runCommand "claude-desktop-dlopen-runpath"
           continue
         fi
         pairs=$((pairs + 1))
-        if ! resolveIn "$rel" "$s" >/dev/null; then
+        # What the loader is actually asked for. For a runtime-versioned
+        # spelling the binary never opens the string it carries — it appends
+        # the ABI version first — so resolving the literal would fail the
+        # package the day a dependency stops shipping the unversioned
+        # development symlink, while the library it really opens is still
+        # there. For everything else the literal is what gets opened, with the
+        # mapped soname accepted as a fallback for second spellings, which the
+        # binary tries alongside the exact name.
+        if [ -n "''${SUBST[$s]-}" ]; then
+          if ! resolveIn "$rel" "''${SUBST[$s]}" >/dev/null; then
+            printf '  FAIL    %-26s named by %s; its runtime soname %s is unresolvable from that RUNPATH\n' \
+              "$s" "$rel" "''${SUBST[$s]}"
+            rc=1
+          fi
+        elif ! resolveIn "$rel" "$s" >/dev/null \
+          && ! resolveIn "$rel" "$(meaningOf "$s")" >/dev/null; then
           printf '  FAIL    %-26s named by %s, unresolvable from its RUNPATH\n' "$s" "$rel"
           rc=1
         fi

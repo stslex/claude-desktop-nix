@@ -205,9 +205,10 @@ see a soname assembled at runtime — `libva` is the live case, and why
 that stands for `libva.so.2`. Only those may substitute: the six entries in
 `dlopenSonamesSecondSpellings` are spellings the binary carries *beside* the
 exact soname, so they classify the string but never prove the exact one is
-still there. It reads ELF objects only, nothing inside `app.asar`, and it
-expands `$ORIGIN` per object the way the loader does rather than testing it as
-a literal path.
+still there. It reads ELF objects only, nothing inside `app.asar`. It resolves
+what the loader is actually asked for — `$ORIGIN` expanded per object, and the
+mapped soname rather than the literal string for a runtime-versioned spelling —
+so a working package is not failed on a technicality.
 
 ## Updating
 
