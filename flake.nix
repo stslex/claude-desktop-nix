@@ -49,6 +49,21 @@
         claude-desktop-dev-fhs = final.callPackage ./pkgs/claude-desktop-fhs.nix {
           claude-desktop = final.claude-desktop-dev;
         };
+
+        # Cowork-enabled variant. Same application and same FHS sandbox as
+        # claude-desktop-fhs, plus QEMU, OVMF and virtiofsd at the paths the
+        # app's Linux virtualization probe searches.
+        #
+        # A separate output rather than a change to claude-desktop-fhs because
+        # the VM toolchain roughly doubles that variant's marginal closure, and
+        # the two audiences do not overlap: wanting `npx` to resolve says
+        # nothing about wanting a hypervisor. Nothing here alters
+        # claude-desktop or claude-desktop-fhs, which build to the same store
+        # paths they did before this existed.
+        claude-desktop-cowork = final.callPackage ./pkgs/claude-desktop-fhs.nix {
+          cowork = true;
+          ovmf-fhs = final.callPackage ./pkgs/ovmf-fhs.nix { };
+        };
       };
 
       packages = forAllSystems (
@@ -60,6 +75,7 @@
           inherit (pkgs)
             claude-desktop
             claude-desktop-fhs
+            claude-desktop-cowork
             claude-desktop-dev
             claude-desktop-dev-fhs
             ;
@@ -121,6 +137,20 @@
           # documented at the top of the file itself.
           dlopen-runpath = pkgs.callPackage ./pkgs/dlopen-runpath.nix {
             inherit claude-desktop;
+          };
+
+          # Both Cowork variants, because the `leanQemu` build is the one
+          # with a real reason to fail these assertions and the cached
+          # `qemu_kvm` build is the one that never will. Checking only the
+          # default would leave the trimmed QEMU — a public option with a
+          # documented risk — with no coverage of that risk at all.
+          cowork-fhs-paths = pkgs.callPackage ./pkgs/cowork-fhs-paths.nix {
+            claude-desktop-cowork = self.packages.${system}.claude-desktop-cowork;
+          };
+          cowork-fhs-paths-lean = pkgs.callPackage ./pkgs/cowork-fhs-paths.nix {
+            claude-desktop-cowork = self.packages.${system}.claude-desktop-cowork.override {
+              leanQemu = true;
+            };
           };
         }
       );
