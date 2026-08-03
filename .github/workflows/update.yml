@@ -23,16 +23,59 @@ concurrency:
 
 jobs:
   update:
+    # One leg per channel. `stable` is what main ships; `dev` is the same
+    # upstream .deb built from the dev branch's packaging. Both legs run on a
+    # schedule on purpose: a channel that only moves when someone merges into
+    # it goes stale silently, and the whole point of a dev channel is to be
+    # testable against *current* upstream, not against whatever upstream was
+    # when the branch was last touched.
+    #
+    # The matrix is computed rather than fixed because a manual dispatch should
+    # bump one channel, not both: dispatched from main it runs the stable leg,
+    # from dev or from any throwaway branch it runs the dev leg against that
+    # ref — which is how the updater gets exercised end to end before a change
+    # lands. (A job-level `if` cannot see the matrix context, hence this.)
+    strategy:
+      fail-fast: false
+      matrix:
+        # Folded onto one line by YAML: every continuation sits at the same
+        # indent, so this is a single expression with spaces, not a value with
+        # newlines in it.
+        include: >-
+          ${{ github.event_name == 'schedule'
+          && fromJSON('[{"channel":"stable","branch":"main"},{"channel":"dev","branch":"dev"}]')
+          || (github.ref_name == 'main'
+          && fromJSON('[{"channel":"stable","branch":"main"}]')
+          || fromJSON('[{"channel":"dev","branch":"dev"}]')) }}
+    name: update (${{ matrix.channel }})
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Paired with `base: ${{ matrix.branch }}` on the PR step below, and
+          # only correct as a pair. create-pull-request branches from `base`,
+          # not from whatever is checked out here, so these two decide
+          # different things: `base` picks the branch the bump lands on, this
+          # picks the tree the build and the guards run against. A scheduled
+          # run defaults to the repository's default branch (main), so changing
+          # `base` alone would verify main's tree and then open the PR against
+          # another branch — the contract at the top of this file would still
+          # be enforced, just against a tree the PR does not modify.
+          #
+          # A manual dispatch uses the ref it was dispatched from instead, so
+          # the updater can be exercised end to end from a branch before that
+          # branch is merged.
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || matrix.branch }}
 
       - uses: DeterminateSystems/nix-installer-action@main
         with:
           extra-conf: |
             experimental-features = nix-command flakes
 
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      # No binary cache step here on purpose. Magic Nix Cache was retired in
+      # February 2025 and its successor (FlakeHub Cache) needs a FlakeHub
+      # account plus `id-token: write`; until someone wants to own that
+      # credential, no cache is better than one that fails auth on every run.
 
       # The runner's disk is tight: the .deb is ~160 MB and the unpacked
       # derivation is ~500 MB, plus the whole GTK/NSS closure.
@@ -81,6 +124,18 @@ jobs:
           set -euo pipefail
           nix build .#checks.x86_64-linux.dlopen-runpath -L
 
+      # The dev output differs from the default one only in pname and version —
+      # same upstream .deb, same closure — so building it again would prove
+      # nothing the step above has not. Evaluating it does prove the channel
+      # exists and is wired, which is the part that can rot.
+      - name: Check the dev channel output evaluates
+        if: matrix.channel == 'dev' && steps.bump.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          nix eval --raw .#claude-desktop-dev.name
+          echo
+          test "$(nix eval --raw .#claude-desktop-dev.passthru.channel)" = dev
+
       - name: Run flake checks
         if: steps.bump.outputs.changed == 'true'
         run: |
@@ -89,17 +144,21 @@ jobs:
 
       - name: Open pull request
         if: steps.bump.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
-          branch: update/claude-desktop-${{ steps.bump.outputs.version }}
-          base: main
+          # The channel is in the branch name because both legs can land on the
+          # same upstream version on the same day, and two legs pushing one
+          # branch would race.
+          branch: update/${{ matrix.channel }}/claude-desktop-${{ steps.bump.outputs.version }}
+          base: ${{ matrix.branch }}
           commit-message: "claude-desktop: ${{ steps.bump.outputs.version }}"
-          title: "claude-desktop: ${{ steps.bump.outputs.version }}"
+          title: "claude-desktop: ${{ steps.bump.outputs.version }} (${{ matrix.channel }})"
           delete-branch: true
           add-paths: |
             sources.json
           body: |
-            Automated bump to **${{ steps.bump.outputs.version }}** from
+            Automated bump of the **${{ matrix.channel }}** channel to
+            **${{ steps.bump.outputs.version }}**, from
             [Anthropic's APT index](https://downloads.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages).
 
             Verified in CI before this PR was opened:

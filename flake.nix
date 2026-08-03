@@ -25,6 +25,10 @@
           inherit system;
           config.allowUnfree = true;
         };
+      # The packaging revision this flake was evaluated from, for the dev
+      # channel's version string. `shortRev` is absent on a dirty tree, which
+      # is exactly when saying so is useful.
+      channelRev = self.shortRev or self.dirtyShortRev or "dirty";
     in
     {
       overlays.default = final: _prev: {
@@ -32,6 +36,19 @@
         # claude-desktop is taken from `final`, so an override of the base
         # package (e.g. a different passwordStore) flows into the FHS variant.
         claude-desktop-fhs = final.callPackage ./pkgs/claude-desktop-fhs.nix { };
+
+        # The dev channel: the same upstream .deb, built from this branch's
+        # packaging. Same binary, same desktop entry, different pname and a
+        # version that sorts below stable — so it can be installed and tested
+        # without a consumer rewriting its wrappers, and without a stable
+        # consumer ever resolving to it by accident.
+        claude-desktop-dev = final.callPackage ./pkgs/claude-desktop.nix {
+          channel = "dev";
+          inherit channelRev;
+        };
+        claude-desktop-dev-fhs = final.callPackage ./pkgs/claude-desktop-fhs.nix {
+          claude-desktop = final.claude-desktop-dev;
+        };
       };
 
       packages = forAllSystems (
@@ -40,7 +57,12 @@
           pkgs = (pkgsFor system).extend self.overlays.default;
         in
         {
-          inherit (pkgs) claude-desktop claude-desktop-fhs;
+          inherit (pkgs)
+            claude-desktop
+            claude-desktop-fhs
+            claude-desktop-dev
+            claude-desktop-dev-fhs
+            ;
           default = pkgs.claude-desktop;
         }
       );
@@ -93,74 +115,13 @@
                 touch $out
               '';
 
-          # Static regression guard for the dlopen'd libraries.
-          #
-          # Why this exists: `nix build` stays green when a dlopen'd soname
-          # stops resolving, because dlopen failure is a runtime event, not a
-          # link error. The specific regression it guards is silent and
-          # security-relevant — if libsecret-1.so.0 drops out of the RUNPATH
-          # (an Electron bump changing layout, someone editing runtimeLibs,
-          # appendRunpaths breaking), os_crypt falls back from a
-          # keyring-derived v11 key to the hardcoded-password v10 path and
-          # the session token quietly stops being protected.
-          #
-          # Deliberately static: it resolves each soname against the RUNPATH
-          # entries of the ELF that dlopen()s them, rather than launching the
-          # app. An Xvfb launch check would be strictly worse here — it needs
-          # a display, a D-Bus session and a live Secret Service provider to
-          # tell v10 from v11, none of which exist in the build sandbox, and
-          # it would be slow and flaky in exchange for testing the same
-          # property this resolves directly.
-          dlopen-runpath =
-            pkgs.runCommand "claude-desktop-dlopen-runpath"
-              {
-                nativeBuildInputs = [ pkgs.patchelf ];
-                sonames = claude-desktop.dlopenSonames;
-              }
-              ''
-                elf=${claude-desktop}/lib/claude-desktop/claude-desktop
-                test -f "$elf" || { echo "FAIL: main executable missing"; exit 1; }
-
-                runpath=$(patchelf --print-rpath "$elf")
-                echo "RUNPATH has $(printf '%s' "$runpath" | tr ':' '\n' | grep -c .) entries"
-
-                IFS=: read -ra dirs <<< "$runpath"
-
-                # An empty RUNPATH element means $ORIGIN-relative "current
-                # directory" at load time — the same class of bug as an empty
-                # LD_LIBRARY_PATH element. Never acceptable.
-                for d in "''${dirs[@]}"; do
-                  if [ -z "$d" ]; then
-                    echo "FAIL: RUNPATH contains an empty element (resolves to cwd)"
-                    exit 1
-                  fi
-                done
-
-                rc=0
-                for soname in $sonames; do
-                  hit=""
-                  for d in "''${dirs[@]}"; do
-                    if [ -e "$d/$soname" ]; then hit="$d"; break; fi
-                  done
-                  if [ -n "$hit" ]; then
-                    printf '  ok      %-24s -> %s\n' "$soname" "$hit"
-                  else
-                    printf '  FAIL    %-24s unresolvable from RUNPATH\n' "$soname"
-                    rc=1
-                  fi
-                done
-
-                if [ $rc -ne 0 ]; then
-                  echo
-                  echo "One or more dlopen'd sonames no longer resolve. This does NOT"
-                  echo "break the build at runtime with an error — the corresponding"
-                  echo "feature silently switches off. For libsecret-1.so.0 that means"
-                  echo "the session token drops from v11 to v10 obfuscation."
-                  exit 1
-                fi
-
-                touch $out
-              '';
+          # Static regression guard for the dlopen'd libraries: resolve,
+          # reference and novelty assertions against a fresh scan of the
+          # shipped ELFs. The rationale, and the limits of a string scan, are
+          # documented at the top of the file itself.
+          dlopen-runpath = pkgs.callPackage ./pkgs/dlopen-runpath.nix {
+            inherit claude-desktop;
+          };
         }
       );
 

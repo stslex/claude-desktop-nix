@@ -18,8 +18,10 @@ $ nix run github:<you>/claude-desktop-nix
 | --- | --- |
 | `packages.default` / `packages.claude-desktop` | The app. Use this one. |
 | `packages.claude-desktop-fhs` | Same app inside a `buildFHSEnv` that provides `npx`, `uvx`, `docker`, `git`, `python3` at conventional FHS paths, so published MCP server configs work unmodified. |
-| `overlays.default` | Adds `claude-desktop` and `claude-desktop-fhs` to a nixpkgs instance. |
+| `packages.claude-desktop-dev` / `-dev-fhs` | The same build from the **dev** packaging channel — see [Channels](#channels). |
+| `overlays.default` | Adds `claude-desktop`, `claude-desktop-fhs` and their `-dev` counterparts to a nixpkgs instance. |
 | `checks.wrapper-flags` | Asserts the wrapper keeps its flags, never gains `--no-sandbox`, ships `chrome-sandbox`, and has a valid desktop entry with rewritten `Exec=` lines. |
+| `checks.dlopen-runpath` | Scans every shipped ELF for soname strings and asserts that each library this package provides resolves from the RUNPATH of every object naming it, that nothing on the lists has stopped being named, and that nothing *new* is named without being classified. See [Dependency provenance](#dependency-provenance). |
 
 ### NixOS
 
@@ -33,6 +35,54 @@ $ nix run github:<you>/claude-desktop-nix
   nixpkgs.config.allowUnfree = true; # or allowUnfreePredicate for just this
 }
 ```
+
+## Channels
+
+Anthropic publishes exactly one APT suite — `Suite: stable`, `Components: main`
+in `dists/stable/Release` — so a channel here cannot mean a different upstream
+build. It means a different **packaging branch**:
+
+| Channel | Branch | Output | Version |
+| --- | --- | --- | --- |
+| stable | `main` | `packages.default`, `packages.claude-desktop` | `1.24012.9` |
+| dev | `dev` | `packages.claude-desktop-dev` | `1.24012.9-pre.dev.<rev>` |
+
+Both build the same upstream `.deb`. The dev channel exists so packaging changes
+can be installed and actually run before they land on `main` — the app is the
+constant, the packaging is what is under test.
+
+Three properties are deliberate:
+
+- **The binary and the desktop entry do not change.** `bin/claude-desktop`,
+  `com.anthropic.Claude.desktop`, `mainProgram` — all identical. Switching a
+  consumer between channels is a one-line input change, not a rewrite of
+  whatever wraps it.
+- **The dev version sorts *below* stable.** `-pre` is a pre-release marker to
+  Nix, so `compareVersions "1.24012.9-pre.dev.abc" "1.24012.9" == -1`. A stable
+  consumer with both overlays in scope cannot resolve to the dev build by
+  accident. (A `-dev.` suffix sorts the other way — measured, not assumed.)
+- **Both channels keep tracking upstream.** The updater runs one matrix leg per
+  channel on its daily schedule, so `dev` does not freeze at whatever upstream
+  version was current when it was last merged. A channel nobody bumps is a
+  channel that silently tests an old app.
+
+Consuming the dev channel:
+
+```nix
+{
+  inputs.claude-desktop-nix.url = "github:<you>/claude-desktop-nix/dev";
+
+  # …
+  environment.systemPackages = [
+    inputs.claude-desktop-nix.packages.${system}.claude-desktop-dev
+  ];
+}
+```
+
+`nix flake check` covers the stable instantiation only. The dev output differs
+in `pname` and `version` and in nothing else — same `.deb`, same closure — so
+running the guards twice would assert the same facts about the same bytes; the
+updater's dev leg evaluates the output instead, which is the part that can rot.
 
 ## The sandbox
 
@@ -181,6 +231,48 @@ discarded — use `appendRunpaths`.
 `node-pty`'s `pty.node` needs `libstdc++.so.6`; both are in `buildInputs` so
 autopatchelf stays clean, but neither is wired into any feature here — Cowork
 and KVM plumbing is out of scope.
+
+**How this list is kept honest across upstream bumps.**
+`checks.dlopen-runpath` re-derives the picture from the binary on every run
+instead of trusting the hand-written list. It scans every shipped ELF for
+soname-shaped strings, then requires each string to be accounted for as
+`DT_NEEDED`, bundled with the app, provided by us (`passthru.dlopenSonames`),
+or waived with a reason (`passthru.dlopenSonamesUnprovided`) — and requires
+every `(object, soname)` pair to resolve from *that object's* RUNPATH, not
+merely from the main executable's. Both halves of that are per-object: being
+`DT_NEEDED` of one object says nothing about whether another can reach it, and
+a waiver ("crashpad probes for libcurl and we ship no crash server") is a claim
+about one binary, so the same soname named by another one is a fresh decision
+rather than a free pass.
+
+So a bump that starts `dlopen`ing something new fails the check with that
+soname named, rather than shipping a feature that silently does nothing; a bump
+that stops using one fails too, waivers included, so no entry can rot into an
+assertion that passes while testing nothing. It is a string scan, so it cannot
+see a soname assembled at runtime — `libva` is the live case, and why
+`passthru.dlopenSonamesRuntimeVersioned` declares — for the one object that
+does it — that `libva.so` stands for `libva.so.2`. Only those may substitute: the six entries in
+`dlopenSonamesSecondSpellings` are spellings the binary carries *beside* the
+exact soname, so they classify the string but never prove the exact one is
+still there. It reads ELF objects only, nothing inside `app.asar`. It resolves
+what the loader is actually asked for — `$ORIGIN` expanded per object, and the
+mapped soname rather than the literal string for a runtime-versioned spelling —
+so a working package is not failed on a technicality. Where a spelling is one
+the binary carries *beside* the exact soname, the substitution only applies to
+an object that looks like it tries both — decided by byte offset: the name has
+to occur inside a `PT_LOAD` segment (so a call site can reach it at runtime;
+`dontStrip = true` keeps unmapped metadata sections in the file) and outside
+the dynamic string table (which is where the linker records `DT_NEEDED` and
+`DT_SONAME`), located through `PT_DYNAMIC` rather than by section-header name,
+since section headers are optional. An object whose only call
+is `dlopen("libnotify.so")` is broken when just `libnotify.so.4` exists,
+however it is linked, and is reported. The same evidence gates every other claim a spelling can make: inheriting its
+target's waiver, keeping a waiver alive, and standing in as a runtime-composed
+version. In each case a soname an object merely links is one the build resolved,
+which is the opposite of a probe this package declined to satisfy, and one that
+survives only in debug metadata is not a call site at all: a soname an
+object merely links is one the build resolved, which is the opposite of a probe
+this package declined to satisfy.
 
 ## Updating
 

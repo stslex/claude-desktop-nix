@@ -59,6 +59,25 @@
 
   sources ? lib.importJSON ../sources.json,
 
+  # Packaging channel. Anthropic publishes exactly one APT suite (`stable`,
+  # component `main` — checked against dists/stable/Release), so a channel here
+  # cannot mean a different upstream artifact the way it does for a project
+  # that builds its own. It means a different *packaging* branch: `main` ships
+  # the stable channel, `dev` builds the same upstream .deb with whatever
+  # packaging changes are still in review, so they can be installed and run
+  # before they land.
+  #
+  # The binary, the desktop entry and mainProgram are deliberately unchanged —
+  # a consumer swapping channels should not have to rewrite its wrappers. Only
+  # pname and version differ, which is what makes the two distinguishable in a
+  # profile and in the store path.
+  channel ? "stable",
+
+  # Packaging revision, for the dev channel's version string. flake.nix is the
+  # only thing that knows it; a bare `nix-build` of this file has no rev and
+  # simply omits it.
+  channelRev ? "",
+
   # Chromium's os_crypt backend. Justification:
   #
   # The bundled binary supports exactly two real backends — libsecret
@@ -155,8 +174,20 @@ let
   ];
 in
 stdenv.mkDerivation (finalAttrs: {
-  pname = "claude-desktop";
-  version = sources.version;
+  pname = if channel == "dev" then "claude-desktop-dev" else "claude-desktop";
+
+  # `-pre` is load-bearing, not decoration: Nix treats it as a pre-release
+  # marker that sorts *below* the empty string, so
+  #
+  #   compareVersions "1.24012.9-pre.dev.abc1234" "1.24012.9" == -1
+  #
+  # A `-dev.` suffix would sort the other way (measured: == 1) and let a
+  # stable consumer with both overlays in scope resolve to the dev build.
+  version =
+    sources.version
+    + lib.optionalString (channel == "dev") (
+      "-pre.dev" + lib.optionalString (channelRev != "") ".${channelRev}"
+    );
 
   src = fetchurl { inherit (source) url hash; };
 
@@ -310,28 +341,34 @@ stdenv.mkDerivation (finalAttrs: {
     '';
 
   passthru = {
+    inherit channel;
     inherit (source) url;
     updateScript = ./update.sh;
 
-    # Consumed by checks.dlopen-runpath. Every entry is a soname the main
-    # executable dlopen()s (string-scanned out of the binary — the same list
-    # runtimeLibs is derived from), restricted to those whose absence
-    # *degrades silently* instead of crashing. That is precisely the class a
-    # green build cannot catch: dlopen returning NULL is a feature quietly
-    # switching itself off, not a link error.
+    # ---- consumed by checks.dlopen-runpath ------------------------------
     #
-    # libsecret-1.so.0 is the one that matters most: lose it and os_crypt
-    # falls back from a keyring-derived v11 key to the hardcoded-password
-    # v10 path, i.e. the session token silently stops being protected while
-    # everything still appears to work.
+    # The guard rescans the shipped ELFs for soname-shaped strings on every
+    # run and reconciles the scan against these three lists, so a list that
+    # stops describing the binary fails instead of quietly passing. Between
+    # them they must account for every soname the payload names that is not
+    # already covered by DT_NEEDED (autoPatchelfHook's job) or bundled with
+    # the app.
     #
-    # Deliberately NOT listed: libnotify.so.1 / libnotify.so.5. The binary
-    # probes several libnotify versions in turn and only needs one; nixpkgs
-    # ships .so.4. Asserting the others would fail for no reason.
+    # Sonames this package is responsible for providing: named by a shipped
+    # ELF, covered by no DT_NEEDED entry, and required to resolve from the
+    # RUNPATH of the object that opens them.
+    #
+    # libsecret-1.so.0 is the one that motivated the guard: lose it and
+    # os_crypt falls back from a keyring-derived v11 key to the
+    # hardcoded-password v10 path, i.e. the session token silently stops being
+    # protected while everything still appears to work. Most of the others
+    # fail the same way — dlopen returns NULL and a feature switches itself
+    # off — which is exactly the class a green build cannot catch.
     dlopenSonames = [
       "libsecret-1.so.0" # os_crypt keyring -> v11 vs v10
       "libnotify.so.4" # desktop notifications
       "libgdk_pixbuf-2.0.so.0" # image loading
+      "libgdk-3.so.0" # GTK loader, alongside DT_NEEDED libgtk-3.so.0
       "libpulse.so.0" # audio output
       "libGL.so.1" # GPU compositing
       "libEGL.so.1"
@@ -343,8 +380,7 @@ stdenv.mkDerivation (finalAttrs: {
       "libgssapi_krb5.so.2" # SPNEGO / Negotiate auth
       "libdbusmenu-glib.so.4" # tray menus
       "libspeechd.so.2" # accessibility TTS
-      "libuuid.so.1"
-      "libXtst.so.6"
+      "libnssckbi.so" # NSS builtin trust roots
       "libXcursor.so.1"
       "libX11-xcb.so.1"
       "libxcb-dri3.so.0"
@@ -352,10 +388,122 @@ stdenv.mkDerivation (finalAttrs: {
       "libxcb-present.so.0"
       "libxcb-sync.so.1"
     ];
+
+    # Held to the resolve assertion but exempt from the reference assertion:
+    # upstream's `Depends` lists them, so runtimeLibs keeps providing them,
+    # but no string in any shipped ELF names them (rechecked at 1.24012.9).
+    # Keeping them here asserts they stay reachable without claiming a
+    # reference the scan cannot show.
+    dlopenSonamesDependsOnly = [
+      "libuuid.so.1"
+      "libXtst.so.6"
+    ];
+
+    # Named by the payload and deliberately NOT provided, keyed by the object
+    # that names it. Object-scoped rather than a flat list because a waiver is
+    # a statement about one binary's behaviour: "crashpad probes for libcurl
+    # and we ship no crash server" says nothing about the main executable
+    # suddenly probing for it. A soname waived here for object A is still a
+    # hard failure when object B names it.
+    #
+    # Every entry is a conscious "no" with a reason. Anything named by the
+    # payload and absent from all of these lists fails the guard, and a waiver
+    # whose object stops naming it fails too.
+    dlopenSonamesUnprovided = {
+      "lib/claude-desktop/claude-desktop" = [
+        # Probe alternates: the binary tries several sonames for one feature
+        # and uses whichever it finds. The one we do provide is in
+        # dlopenSonames.
+        "libnotify.so.1" # provided: libnotify.so.4
+        "libnotify.so.5"
+        "libgssapi.so.1" # Heimdal; provided: MIT libgssapi_krb5.so.2
+        "libgssapi.so.2"
+        "libgssapi.so.4"
+        "libgtk-4.so.1" # GTK4; the payload links GTK3 (DT_NEEDED)
+        "libunity.so.4" # Ubuntu Unity launcher API; no such desktop
+        "libunity.so.6"
+        "libunity.so.9"
+
+        # Supplied by the impure driver link (addDriverRunpath, last RUNPATH
+        # entry) at runtime, never by the closure — nothing to assert in a
+        # sandboxed build.
+        "libGLX_nvidia.so.0"
+        "libvulkan_intel.so"
+        "libvulkan_radeon.so"
+        "libvulkan_freedreno.so"
+
+        # glibc's own name-service modules; they ship with libc, not with us.
+        "libnss_compat.so.2"
+        "libnss_files.so.2"
+
+        # Optional Google components upstream fetches at runtime; nixpkgs
+        # packages none of them, and absent they are simply unavailable.
+        "libsoda.so" # on-device speech
+        "libLiteRtGpuAccelerator.so"
+        "libLiteRtVulkanAccelerator.so"
+        "libLiteRtWebGpuAccelerator.so"
+
+        # Injected by hand when someone is debugging a GPU capture.
+        "librenderdoc.so"
+      ];
+
+      # Crash-upload transport. No crash server is configured, so the
+      # transport is never constructed — a claim about this binary only.
+      "lib/claude-desktop/chrome_crashpad_handler" = [
+        "libcurl.so.4"
+        "libcurl-gnutls.so.4"
+        "libcurl-nss.so.4"
+      ];
+
+      # The bundled software-Vulkan driver's own window-system integration.
+      # The app itself names neither.
+      "lib/claude-desktop/libvk_swiftshader.so" = [
+        "libwayland-client.so.0"
+        "libxcb-shm.so.0"
+      ];
+    };
+
+    # Sonames whose ABI version the binary appends at runtime: the versioned
+    # string never appears in the payload at all, so the unversioned spelling
+    # is the only evidence there is, and it *does* stand in for the exact
+    # string when the guard asks "is this soname still named". Verified at
+    # 1.24012.9: neither libva.so.2 nor libva-drm.so.2 appears in any shipped
+    # ELF, while both unversioned forms do.
+    # Keyed by the object that composes the version, because that is a claim
+    # about one binary's behaviour: another ELF naming "libva.so" as an
+    # ordinary dlopen literal is asking for that exact file, and the runtime
+    # output need not carry the unversioned development symlink.
+    dlopenSonamesRuntimeVersioned = {
+      "lib/claude-desktop/claude-desktop" = {
+        "libva.so" = "libva.so.2";
+        "libva-drm.so" = "libva-drm.so.2";
+      };
+    };
+
+    # Unversioned spellings the payload carries *in addition to* the exact
+    # soname — the binary names both. These classify the string and make it
+    # inherit the versioned soname's provision or waiver, but they are never
+    # accepted as proof that the versioned soname is still named: the exact
+    # string is right there today, so if it disappears that is real news and
+    # not something the generic spelling should paper over.
+    #
+    # Verified at 1.24012.9: every target below is named exactly by at least
+    # one shipped ELF. If that ever stops being true, the entry belongs in
+    # dlopenSonamesRuntimeVersioned instead — and the guard will say so.
+    dlopenSonamesSecondSpellings = {
+      "libGL.so" = "libGL.so.1";
+      "libcurl.so" = "libcurl.so.4";
+      "libdbusmenu-glib.so" = "libdbusmenu-glib.so.4";
+      "libnotify.so" = "libnotify.so.4";
+      "libpci.so" = "libpci.so.3";
+      "libvulkan.so" = "libvulkan.so.1";
+    };
   };
 
   meta = {
-    description = "Desktop application for Claude.ai";
+    description =
+      "Desktop application for Claude.ai"
+      + lib.optionalString (channel == "dev") " (dev packaging channel)";
     longDescription = ''
       Anthropic's first-party Claude Desktop build for Linux, repackaged from
       the official .deb published at downloads.claude.ai. This is a native
