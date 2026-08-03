@@ -153,6 +153,7 @@ runCommand "claude-desktop-dlopen-runpath"
     # into the second would let object A dlopen a soname that only object B
     # links, with nothing checking that A can actually reach it.
     declare -A RPATH=() RPATHX=() SCANNED=() SEENIN=() NEEDED=() NEEDED_BY=() SONAME=() BUNDLED=()
+    declare -A LITERAL=()
     elfs=()
 
     # -type f here (unlike the bundled inventory below): each real object is
@@ -190,6 +191,33 @@ runCommand "claude-desktop-dlopen-runpath"
         # that do not exist, whose empty RUNPATH then fails every lookup.
         SEENIN["$s"]="''${SEENIN[$s]-}$rel"$'\n' 
       done < <(strings -a "$f" | grep -oE "$sonameRe" | sort -u)
+
+      # Second pass, by byte offset: which of those sonames occur somewhere
+      # *other* than .dynstr. An object's DT_NEEDED entries and its own
+      # DT_SONAME live in that section, so a name found only there is linkage
+      # metadata; the same name found in .rodata as well is a string literal
+      # some code path can pass to dlopen. Only the latter is evidence that
+      # this object tries that spelling itself.
+      dynOff=-1
+      dynEnd=-1
+      dynRange=$(readelf -SW "$f" 2>/dev/null \
+        | sed -E 's/^ *\[[ 0-9]+\] *//' \
+        | awk '$1 == ".dynstr" { print $4, $5; exit }' || true)
+      if [ -n "$dynRange" ]; then
+        read -r dynHexOff dynHexSize <<< "$dynRange"
+        dynOff=$((16#$dynHexOff))
+        dynEnd=$((dynOff + 16#$dynHexSize))
+      fi
+      while IFS= read -r s; do
+        LITERAL["$rel"]="''${LITERAL[$rel]-}$s"$'\n' 
+      done < <(
+        strings -a -t d "$f" \
+          | awk -v off="$dynOff" -v end="$dynEnd" '{
+              o = $1 + 0
+              if (off < 0 || o < off || o >= end) { $1 = ""; print }
+            }' \
+          | grep -oE "$sonameRe" | sort -u
+      )
       while IFS= read -r n; do
         NEEDED["$n"]=1
         NEEDED_BY["$rel"]="''${NEEDED_BY[$rel]-}$n "
@@ -211,17 +239,20 @@ runCommand "claude-desktop-dlopen-runpath"
     #
     # Stricter than namesIt, and the difference matters: an object's DT_NEEDED
     # entries and its own DT_SONAME live in .dynstr, which is part of the file
-    # and therefore part of the string scan. A soname present only for that
-    # reason is linkage metadata, not a second dlopen attempt — and dlopen
-    # matches on the name asked for, so a call to the generic spelling still
-    # returns NULL when only the versioned file is on the RUNPATH, however
-    # the object is linked.
+    # and therefore part of the string scan. A soname found only there is
+    # linkage metadata, not a dlopen attempt — and dlopen matches on the name
+    # asked for, so a call to the generic spelling still returns NULL when
+    # only the versioned file is on the RUNPATH, however the object is linked.
+    #
+    # Decided by where the occurrences are, not by subtracting DT_NEEDED names:
+    # an ELF may perfectly well link libfoo.so.4 *and* carry it as a literal
+    # fallback after trying libfoo.so, and that object does try both.
     triesItself() { # $1 = object, $2 = exact soname
-      case " ''${NEEDED_BY[$1]-} " in
-        *" $2 "*) return 1 ;;
-      esac
-      if [ "$2" = "''${SONAME[$1]-}" ]; then return 1; fi
-      namesIt "$1" "$2"
+      local r
+      while IFS= read -r r; do
+        if [ "$r" = "$2" ]; then return 0; fi
+      done <<< "''${LITERAL[$1]-}"
+      return 1
     }
 
     # Echoes the RUNPATH directory a soname resolves from, or returns 1.
