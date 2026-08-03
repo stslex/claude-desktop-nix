@@ -34,7 +34,13 @@
 # this package deliberately does not add --no-sandbox to paper over it. Use
 # packages.default if you do not need MCP subprocess tooling.
 buildFHSEnv {
-  pname = "claude-desktop-fhs";
+  # Follows the wrapped package's channel, so a dev FHS build is not named
+  # like a stable one in the store or in a profile.
+  pname =
+    if (claude-desktop.channel or "stable") == "dev" then
+      "claude-desktop-dev-fhs"
+    else
+      "claude-desktop-fhs";
   inherit (claude-desktop) version;
 
   targetPkgs = _: [

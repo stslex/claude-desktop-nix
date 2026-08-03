@@ -59,6 +59,25 @@
 
   sources ? lib.importJSON ../sources.json,
 
+  # Packaging channel. Anthropic publishes exactly one APT suite (`stable`,
+  # component `main` — checked against dists/stable/Release), so a channel here
+  # cannot mean a different upstream artifact the way it does for a project
+  # that builds its own. It means a different *packaging* branch: `main` ships
+  # the stable channel, `dev` builds the same upstream .deb with whatever
+  # packaging changes are still in review, so they can be installed and run
+  # before they land.
+  #
+  # The binary, the desktop entry and mainProgram are deliberately unchanged —
+  # a consumer swapping channels should not have to rewrite its wrappers. Only
+  # pname and version differ, which is what makes the two distinguishable in a
+  # profile and in the store path.
+  channel ? "stable",
+
+  # Packaging revision, for the dev channel's version string. flake.nix is the
+  # only thing that knows it; a bare `nix-build` of this file has no rev and
+  # simply omits it.
+  channelRev ? "",
+
   # Chromium's os_crypt backend. Justification:
   #
   # The bundled binary supports exactly two real backends — libsecret
@@ -155,8 +174,20 @@ let
   ];
 in
 stdenv.mkDerivation (finalAttrs: {
-  pname = "claude-desktop";
-  version = sources.version;
+  pname = if channel == "dev" then "claude-desktop-dev" else "claude-desktop";
+
+  # `-pre` is load-bearing, not decoration: Nix treats it as a pre-release
+  # marker that sorts *below* the empty string, so
+  #
+  #   compareVersions "1.24012.9-pre.dev.abc1234" "1.24012.9" == -1
+  #
+  # A `-dev.` suffix would sort the other way (measured: == 1) and let a
+  # stable consumer with both overlays in scope resolve to the dev build.
+  version =
+    sources.version
+    + lib.optionalString (channel == "dev") (
+      "-pre.dev" + lib.optionalString (channelRev != "") ".${channelRev}"
+    );
 
   src = fetchurl { inherit (source) url hash; };
 
@@ -310,6 +341,7 @@ stdenv.mkDerivation (finalAttrs: {
     '';
 
   passthru = {
+    inherit channel;
     inherit (source) url;
     updateScript = ./update.sh;
 
@@ -469,7 +501,9 @@ stdenv.mkDerivation (finalAttrs: {
   };
 
   meta = {
-    description = "Desktop application for Claude.ai";
+    description =
+      "Desktop application for Claude.ai"
+      + lib.optionalString (channel == "dev") " (dev packaging channel)";
     longDescription = ''
       Anthropic's first-party Claude Desktop build for Linux, repackaged from
       the official .deb published at downloads.claude.ai. This is a native

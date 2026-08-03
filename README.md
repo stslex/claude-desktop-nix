@@ -18,7 +18,8 @@ $ nix run github:<you>/claude-desktop-nix
 | --- | --- |
 | `packages.default` / `packages.claude-desktop` | The app. Use this one. |
 | `packages.claude-desktop-fhs` | Same app inside a `buildFHSEnv` that provides `npx`, `uvx`, `docker`, `git`, `python3` at conventional FHS paths, so published MCP server configs work unmodified. |
-| `overlays.default` | Adds `claude-desktop` and `claude-desktop-fhs` to a nixpkgs instance. |
+| `packages.claude-desktop-dev` / `-dev-fhs` | The same build from the **dev** packaging channel — see [Channels](#channels). |
+| `overlays.default` | Adds `claude-desktop`, `claude-desktop-fhs` and their `-dev` counterparts to a nixpkgs instance. |
 | `checks.wrapper-flags` | Asserts the wrapper keeps its flags, never gains `--no-sandbox`, ships `chrome-sandbox`, and has a valid desktop entry with rewritten `Exec=` lines. |
 | `checks.dlopen-runpath` | Scans every shipped ELF for soname strings and asserts that each library this package provides resolves from the RUNPATH of every object naming it, that nothing on the lists has stopped being named, and that nothing *new* is named without being classified. See [Dependency provenance](#dependency-provenance). |
 
@@ -34,6 +35,54 @@ $ nix run github:<you>/claude-desktop-nix
   nixpkgs.config.allowUnfree = true; # or allowUnfreePredicate for just this
 }
 ```
+
+## Channels
+
+Anthropic publishes exactly one APT suite — `Suite: stable`, `Components: main`
+in `dists/stable/Release` — so a channel here cannot mean a different upstream
+build. It means a different **packaging branch**:
+
+| Channel | Branch | Output | Version |
+| --- | --- | --- | --- |
+| stable | `main` | `packages.default`, `packages.claude-desktop` | `1.24012.9` |
+| dev | `dev` | `packages.claude-desktop-dev` | `1.24012.9-pre.dev.<rev>` |
+
+Both build the same upstream `.deb`. The dev channel exists so packaging changes
+can be installed and actually run before they land on `main` — the app is the
+constant, the packaging is what is under test.
+
+Three properties are deliberate:
+
+- **The binary and the desktop entry do not change.** `bin/claude-desktop`,
+  `com.anthropic.Claude.desktop`, `mainProgram` — all identical. Switching a
+  consumer between channels is a one-line input change, not a rewrite of
+  whatever wraps it.
+- **The dev version sorts *below* stable.** `-pre` is a pre-release marker to
+  Nix, so `compareVersions "1.24012.9-pre.dev.abc" "1.24012.9" == -1`. A stable
+  consumer with both overlays in scope cannot resolve to the dev build by
+  accident. (A `-dev.` suffix sorts the other way — measured, not assumed.)
+- **Both channels keep tracking upstream.** The updater runs one matrix leg per
+  channel on its daily schedule, so `dev` does not freeze at whatever upstream
+  version was current when it was last merged. A channel nobody bumps is a
+  channel that silently tests an old app.
+
+Consuming the dev channel:
+
+```nix
+{
+  inputs.claude-desktop-nix.url = "github:<you>/claude-desktop-nix/dev";
+
+  # …
+  environment.systemPackages = [
+    inputs.claude-desktop-nix.packages.${system}.claude-desktop-dev
+  ];
+}
+```
+
+`nix flake check` covers the stable instantiation only. The dev output differs
+in `pname` and `version` and in nothing else — same `.deb`, same closure — so
+running the guards twice would assert the same facts about the same bytes; the
+updater's dev leg evaluates the output instead, which is the part that can rot.
 
 ## The sandbox
 

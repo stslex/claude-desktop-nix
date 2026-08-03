@@ -25,6 +25,10 @@
           inherit system;
           config.allowUnfree = true;
         };
+      # The packaging revision this flake was evaluated from, for the dev
+      # channel's version string. `shortRev` is absent on a dirty tree, which
+      # is exactly when saying so is useful.
+      channelRev = self.shortRev or self.dirtyShortRev or "dirty";
     in
     {
       overlays.default = final: _prev: {
@@ -32,6 +36,19 @@
         # claude-desktop is taken from `final`, so an override of the base
         # package (e.g. a different passwordStore) flows into the FHS variant.
         claude-desktop-fhs = final.callPackage ./pkgs/claude-desktop-fhs.nix { };
+
+        # The dev channel: the same upstream .deb, built from this branch's
+        # packaging. Same binary, same desktop entry, different pname and a
+        # version that sorts below stable — so it can be installed and tested
+        # without a consumer rewriting its wrappers, and without a stable
+        # consumer ever resolving to it by accident.
+        claude-desktop-dev = final.callPackage ./pkgs/claude-desktop.nix {
+          channel = "dev";
+          inherit channelRev;
+        };
+        claude-desktop-dev-fhs = final.callPackage ./pkgs/claude-desktop-fhs.nix {
+          claude-desktop = final.claude-desktop-dev;
+        };
       };
 
       packages = forAllSystems (
@@ -40,7 +57,12 @@
           pkgs = (pkgsFor system).extend self.overlays.default;
         in
         {
-          inherit (pkgs) claude-desktop claude-desktop-fhs;
+          inherit (pkgs)
+            claude-desktop
+            claude-desktop-fhs
+            claude-desktop-dev
+            claude-desktop-dev-fhs
+            ;
           default = pkgs.claude-desktop;
         }
       );
