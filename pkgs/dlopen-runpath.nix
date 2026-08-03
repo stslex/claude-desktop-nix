@@ -153,7 +153,16 @@ runCommand "claude-desktop-dlopen-runpath"
     done <<< "$unprovided"
 
     isWaivedFor() { # $1 = object, $2 = scanned string
-      if [ -n "''${WAIVED[$1$'\t'$(meaningOf "$2")]-}" ]; then return 0; fi
+      local target
+      target=$(meaningOf "$2")
+      if [ -z "''${WAIVED[$1$'\t'$target]-}" ]; then return 1; fi
+      if [ "$target" = "$2" ]; then return 0; fi
+      # An alias inherits a waiver only where this object shows the same
+      # evidence the fallback demands: the waived soname carried as a mapped
+      # literal here, not merely linked. Otherwise "we do not provide
+      # libcurl.so.4" would silently excuse a dlopen("libcurl.so") in an
+      # object that links libcurl and would have resolved it.
+      if triesItself "$1" "$target"; then return 0; fi
       return 1
     }
 
@@ -502,9 +511,12 @@ runCommand "claude-desktop-dlopen-runpath"
     # that does matter. Only dependsOnly is exempt from having to be named.
     echo
     echo "== reference: waivers are still named by the object they were written for"
-    namedBy() { # $1 = object, $2 = soname; the exact string, or a spelling
-                # whose version the binary composes at runtime
-      if namesIt "$1" "$2"; then return 0; fi
+    namedBy() { # $1 = object, $2 = soname; the exact string as a mapped
+                # literal, or a spelling whose version the binary composes at
+                # runtime. Linkage metadata does not keep a waiver alive: a
+                # soname this object merely links is one the build resolved,
+                # which is the opposite of a probe we declined to provide.
+      if triesItself "$1" "$2"; then return 0; fi
       local a
       for a in "''${!SUBST[@]}"; do
         if [ "''${SUBST[$a]}" = "$2" ] && namesIt "$1" "$a"; then return 0; fi

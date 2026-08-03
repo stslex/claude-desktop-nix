@@ -26,7 +26,7 @@ under measurement, and now carries the evidence it should have had:
   which is exactly what makes them easy to confuse. The claim stands; the proof
   is now in D1.
 
-Ten further review rounds on the rewrite found fifteen more holes in the
+Eleven further review rounds on the rewrite found sixteen more holes in the
 guard, all now closed and described in D3. Round two: `DT_NEEDED` was classified
 globally rather than per object, so one object could dlopen a soname only
 another object links with nothing checking it could reach it; and a waiver
@@ -67,7 +67,10 @@ exclude". It is derived from `PT_DYNAMIC`'s `DT_STRTAB`/`DT_STRSZ` now — what
 the loader itself reads. Round eleven scoped the last global table: the
 runtime-versioned spellings carried no object identity, so a *different* ELF
 naming `libva.so` as an ordinary literal would have had `libva.so.2` checked on
-its behalf.
+its behalf. Round twelve found the one path that never reached the
+mapped-literal gate — a spelling could inherit its target's waiver with no
+evidence that the object treats them as the same library, so a probe for the
+generic name was excused by a waiver on a name the object merely links.
 
 The D3 gap is separately closed: the workflow has since run in CI on a real
 bump. All of this is detailed in the sections below.
@@ -832,7 +835,27 @@ keep a payload-wide table, because their substitution is already gated per
 object by the literal test — declaring what is verified would add bookkeeping
 without adding a guarantee.
 
-All eighteen print the same guidance block before exiting, which names the fix
+**A WAIVER INHERITED WITHOUT EVIDENCE.** `libcurl.so` inherits the waiver
+written for `libcurl.so.4`, which is right when the object treats them as one
+library and wrong when it does not. The inheritance had no gate, so the
+mapped-literal rule the fallback had gained in rounds 7–9 did not apply here. An
+object linking the exact soname — `.dynstr` only — while probing the generic
+spelling, with the waiver declared for it:
+
+```
+round-11 check                       round-12 check
+  (no finding)                         FAIL  libnotify.so    named by lib/…/libwv.so,
+                                             unresolvable from its RUNPATH
+                                       FAIL  libnotify.so.4  stale waiver:
+                                             lib/…/libwv.so no longer names it
+```
+
+Both halves are right. The probe is unresolvable and no longer excused; and the
+waiver is stale, because an object that *links* a library is not an object that
+probes for one we declined to provide — the build resolved it. Waiver staleness
+now takes the same literal evidence for the same reason.
+
+All nineteen print the same guidance block before exiting, which names the fix
 for each failure mode:
 
 ```

@@ -217,7 +217,10 @@ the dynamic string table (which is where the linker records `DT_NEEDED` and
 `DT_SONAME`), located through `PT_DYNAMIC` rather than by section-header name,
 since section headers are optional. An object whose only call
 is `dlopen("libnotify.so")` is broken when just `libnotify.so.4` exists,
-however it is linked, and is reported.
+however it is linked, and is reported. The same evidence gates a spelling
+inheriting its target's waiver, and keeping a waiver alive at all: a soname an
+object merely links is one the build resolved, which is the opposite of a probe
+this package declined to satisfy.
 
 ## Updating
 
