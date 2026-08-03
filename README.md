@@ -20,6 +20,7 @@ $ nix run github:<you>/claude-desktop-nix
 | `packages.claude-desktop-fhs` | Same app inside a `buildFHSEnv` that provides `npx`, `uvx`, `docker`, `git`, `python3` at conventional FHS paths, so published MCP server configs work unmodified. |
 | `overlays.default` | Adds `claude-desktop` and `claude-desktop-fhs` to a nixpkgs instance. |
 | `checks.wrapper-flags` | Asserts the wrapper keeps its flags, never gains `--no-sandbox`, ships `chrome-sandbox`, and has a valid desktop entry with rewritten `Exec=` lines. |
+| `checks.dlopen-runpath` | Scans every shipped ELF for soname strings and asserts three things: the libraries this package provides still resolve from RUNPATH, they are still named by the payload, and nothing *new* is named that hasn't been classified. See [Dependency provenance](#dependency-provenance). |
 
 ### NixOS
 
@@ -181,6 +182,19 @@ discarded — use `appendRunpaths`.
 `node-pty`'s `pty.node` needs `libstdc++.so.6`; both are in `buildInputs` so
 autopatchelf stays clean, but neither is wired into any feature here — Cowork
 and KVM plumbing is out of scope.
+
+**How this list is kept honest across upstream bumps.**
+`checks.dlopen-runpath` re-derives the picture from the binary on every run
+instead of trusting the hand-written list: it scans every shipped ELF for
+soname-shaped strings, then requires each string to be accounted for as
+`DT_NEEDED`, bundled with the app, provided by us (`passthru.dlopenSonames`),
+or waived by name with a reason (`passthru.dlopenSonamesUnprovided`). A bump
+that starts `dlopen`ing something new fails the check with that soname named,
+rather than shipping a feature that silently does nothing; a bump that stops
+using one fails too, so entries cannot rot into assertions that pass while
+testing nothing. It is a string scan, so it cannot see a soname assembled at
+runtime — `libva` is the live case, and why an unversioned stem such as
+`libva.so` counts as a reference for `libva.so.2`.
 
 ## Updating
 

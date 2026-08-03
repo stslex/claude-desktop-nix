@@ -1,14 +1,40 @@
 # Phase D report
 
 Reporting only — no code, flake, workflow or hook changes were made while
-producing this file.
+producing the original of this file.
+
+**Revised 2026-08-03, in response to the review on PR #1.** Two claims did not
+survive scrutiny and are corrected in place rather than annotated, so that what
+is written here is what the tree actually does; a third was challenged, held up
+under measurement, and now carries the evidence it should have had:
+
+- **D3** claimed the soname list "cannot drift" from `runtimeLibs` because the
+  two sit next to each other in the same file. Adjacency is a convention, not
+  a mechanism. The guard now rescans the shipped ELFs on every run and
+  reconciles the lists against that scan — and the first such scan found four
+  of the twenty-two entries no longer confirmable, i.e. the drift the original
+  wording called impossible had already happened.
+- **D4**'s verdict named the SNI host as the owner of the tray behaviour on
+  evidence that cannot establish ownership; the same section then admitted no
+  click was ever observed. The verdict is rewritten to claim only what was
+  measured.
+- **Gap 3** described the leaked keyring value as "a local OSCrypt key for
+  Chrome, not for Claude" and showed nothing to back it, which reads as a
+  contradiction of this report's own v11 finding. Measured since: the leaked
+  item carries `application=chrome` (Google Chrome), Claude Desktop's carries
+  `application=Claude`, and both are *labelled* by product rather than by app —
+  which is exactly what makes them easy to confuse. The claim stands; the proof
+  is now in D1.
+
+The D3 gap is separately closed: the workflow has since run in CI on a real
+bump. All of this is detailed in the sections below.
 
 | Item | Status |
 | --- | --- |
 | D1 — leak audit | **DONE** |
 | D2 — profile hygiene | **DONE** |
-| D3 — v10/v11 regression guard | **PARTIAL** — 4 of 5 requirements met; see the gap at the end of that section |
-| D4 — tray | **DONE** (verdict delivered; one part of the premise is unverified — noted inline) |
+| D3 — v10/v11 regression guard | **DONE** — all five requirements met; one residual inference is stated at the end of that section |
+| D4 — tray | **DONE** (investigation delivered; the verdict is bounded by what was actually measured — see the section) |
 
 ---
 
@@ -62,6 +88,44 @@ $HOME/.claude/projects/<project>/<session>.jsonl
 ```
 
 One file. Nothing deleted, per instruction.
+
+### Which key it is — added 2026-08-03
+
+Review challenged the claim in gap 3 that this value is "a local OSCrypt key
+for Chrome, not for Claude", on the grounds that it contradicts B0: Claude's
+`sessionKey` cookies carry the **v11** tag, so they *are* sealed with a
+Secret-Service-derived key. That was a fair reading of a bare assertion — the
+original showed no evidence for it. Here is the measurement.
+
+The command that produced the leak looked the item up by attribute:
+
+```
+$ secret-tool lookup application chrome      # label = Chrome Safe Storage
+```
+
+Every Chromium-family app stores its own OSCrypt key under the same libsecret
+schema (`chrome_libsecret_os_crypt_password_v2`), separated by an `application`
+attribute. Read from this host's Secret Service — `Label` and `Attributes`
+properties only, no secret values:
+
+```
+LABEL "Chrome Safe Storage"        ATTRS  "application" "chrome"     <- the leaked one
+LABEL "Chromium Safe Storage"      ATTRS  "application" "Claude"     <- Claude Desktop
+LABEL "Chromium Safe Storage"      ATTRS  "application" "chromium"
+(four further unrelated Chromium/Electron apps redacted)
+```
+
+The **label** is not a discriminator: Electron apps keep Chromium's default
+product name, so Claude Desktop's item is labelled `Chromium Safe Storage` —
+`strings` on the shipped binary finds exactly that literal and no
+`Claude Safe Storage`. The `application` attribute is what separates them, and
+the leaked lookup used `chrome`.
+
+So the transcript holds **Google Chrome's** OSCrypt key. It decrypts Chrome's
+own cookie and password stores on this host; it does not decrypt
+`~/.config/Claude/Cookies`, which is sealed with the separate
+`application=Claude` item. B0's v11 finding is untouched — Claude's cookies are
+keyring-derived, from a different keyring entry.
 
 ### Measurement artifact worth knowing
 
@@ -158,110 +222,91 @@ evidence, and two gotchas:
 
 ---
 
-## D3 — v10/v11 regression guard — PARTIAL
+## D3 — v10/v11 regression guard — DONE
 
-Four of the five requested items are complete and verbatim below. The fifth
-(**proof a bump fails loudly**) is only partly satisfied — see the gap at the
-end of this section.
+All five requested items are complete. The guard was rewritten in response to
+review (see the note at the top of this file); what follows describes the
+version now in the tree, not the original.
 
-### 1. The check's source, in full
+### 1. The check, and the three properties it asserts
 
-From `flake.nix`, `checks.x86_64-linux.dlopen-runpath`:
+It moved out of `flake.nix` into `pkgs/dlopen-runpath.nix` when it grew a
+scanner. `flake.nix` now only calls it:
 
 ```nix
-# Static regression guard for the dlopen'd libraries.
-#
-# Why this exists: `nix build` stays green when a dlopen'd soname
-# stops resolving, because dlopen failure is a runtime event, not a
-# link error. The specific regression it guards is silent and
-# security-relevant — if libsecret-1.so.0 drops out of the RUNPATH
-# (an Electron bump changing layout, someone editing runtimeLibs,
-# appendRunpaths breaking), os_crypt falls back from a
-# keyring-derived v11 key to the hardcoded-password v10 path and
-# the session token quietly stops being protected.
-#
-# Deliberately static: it resolves each soname against the RUNPATH
-# entries of the ELF that dlopen()s them, rather than launching the
-# app. An Xvfb launch check would be strictly worse here — it needs
-# a display, a D-Bus session and a live Secret Service provider to
-# tell v10 from v11, none of which exist in the build sandbox, and
-# it would be slow and flaky in exchange for testing the same
-# property this resolves directly.
-dlopen-runpath =
-  pkgs.runCommand "claude-desktop-dlopen-runpath"
-    {
-      nativeBuildInputs = [ pkgs.patchelf ];
-      sonames = claude-desktop.dlopenSonames;
-    }
-    ''
-      elf=${claude-desktop}/lib/claude-desktop/claude-desktop
-      test -f "$elf" || { echo "FAIL: main executable missing"; exit 1; }
-
-      runpath=$(patchelf --print-rpath "$elf")
-      echo "RUNPATH has $(printf '%s' "$runpath" | tr ':' '\n' | grep -c .) entries"
-
-      IFS=: read -ra dirs <<< "$runpath"
-
-      # An empty RUNPATH element means $ORIGIN-relative "current
-      # directory" at load time — the same class of bug as an empty
-      # LD_LIBRARY_PATH element. Never acceptable.
-      for d in "''${dirs[@]}"; do
-        if [ -z "$d" ]; then
-          echo "FAIL: RUNPATH contains an empty element (resolves to cwd)"
-          exit 1
-        fi
-      done
-
-      rc=0
-      for soname in $sonames; do
-        hit=""
-        for d in "''${dirs[@]}"; do
-          if [ -e "$d/$soname" ]; then hit="$d"; break; fi
-        done
-        if [ -n "$hit" ]; then
-          printf '  ok      %-24s -> %s\n' "$soname" "$hit"
-        else
-          printf '  FAIL    %-24s unresolvable from RUNPATH\n' "$soname"
-          rc=1
-        fi
-      done
-
-      if [ $rc -ne 0 ]; then
-        echo
-        echo "One or more dlopen'd sonames no longer resolve. This does NOT"
-        echo "break the build at runtime with an error — the corresponding"
-        echo "feature silently switches off. For libsecret-1.so.0 that means"
-        echo "the session token drops from v11 to v10 obfuscation."
-        exit 1
-      fi
-
-      touch $out
-    '';
+# Static regression guard for the dlopen'd libraries: resolve,
+# reference and novelty assertions against a fresh scan of the
+# shipped ELFs. The rationale, and the limits of a string scan, are
+# documented at the top of the file itself.
+dlopen-runpath = pkgs.callPackage ./pkgs/dlopen-runpath.nix {
+  inherit claude-desktop;
+};
 ```
 
-### 2. Which sonames it asserts, and why
+The reason it exists is unchanged. `nix build` stays green when a dlopen'd
+soname stops resolving, because dlopen failure is a runtime event, not a link
+error. If `libsecret-1.so.0` drops out of the RUNPATH — an Electron bump
+changing layout, someone editing `runtimeLibs`, `appendRunpaths` breaking —
+os_crypt falls back from a keyring-derived **v11** key to the
+hardcoded-password **v10** path, and the session token quietly stops being
+protected.
 
-The list lives in `pkgs/claude-desktop.nix` as `passthru.dlopenSonames`,
-deliberately adjacent to `runtimeLibs` so the two cannot drift:
+What changed is the recognition that resolving a hand-written list only proves
+that the hand-written list still resolves. Three assertions now run against a
+fresh scan of every ELF object in the output:
+
+| | Assertion | The regression it catches |
+| --- | --- | --- |
+| 1 | **RESOLVE** — every soname the package claims to provide resolves from the main executable's RUNPATH, and from the RUNPATH of every other shipped object that names it | the library leaves the closure, or the RUNPATH stops reaching it |
+| 2 | **REFERENCE** — every soname it claims to provide is still named by the payload | upstream drops a dlopen; the list entry becomes an assertion that passes forever while testing nothing |
+| 3 | **NOVELTY** — every soname-shaped string in the payload is accounted for: `DT_NEEDED`, bundled with the app, provided by us, or waived by name with a reason | upstream *adds* a dlopen — which (1) and (2) cannot see at all |
+
+Assertions (2) and (3) are what tie the lists to the binary. The original
+version had neither, which is why its "the two cannot drift" claim was wrong:
+`dlopenSonames` sitting next to `runtimeLibs` is a convention for the person
+editing the file, and conventions are exactly what an upstream bump ignores.
+
+It is still deliberately static — sonames are resolved against RUNPATH entries
+rather than by launching the app. An Xvfb launch check would be strictly worse
+here: it needs a display, a D-Bus session and a live Secret Service provider to
+tell v10 from v11, none of which exist in the build sandbox, and it would be
+slow and flaky in exchange for testing the same property this resolves
+directly.
+
+**Limits of the scan, stated rather than papered over.** It is a string scan.
+A soname assembled at runtime is invisible to it — `libva` is the live example,
+and the reason an unversioned stem counts as a reference. A string can be
+present without any code path reaching the `dlopen`. Only ELF objects are
+scanned; nothing inside `app.asar` is. So (3) is a tripwire for the common
+case, not a proof of completeness.
+
+### 2. The three lists, and the drift the first scan found
+
+They live in `pkgs/claude-desktop.nix` as `passthru`, still next to
+`runtimeLibs` — but now because that is convenient to read, not because
+adjacency is load-bearing.
 
 ```nix
+# Sonames this package is responsible for providing: named by a shipped
+# ELF, covered by no DT_NEEDED entry, and required to resolve from the
+# RUNPATH of the object that opens them.
 dlopenSonames = [
-  "libsecret-1.so.0" # os_crypt keyring -> v11 vs v10
-  "libnotify.so.4" # desktop notifications
+  "libsecret-1.so.0"       # os_crypt keyring -> v11 vs v10
+  "libnotify.so.4"         # desktop notifications
   "libgdk_pixbuf-2.0.so.0" # image loading
-  "libpulse.so.0" # audio output
-  "libGL.so.1" # GPU compositing
+  "libgdk-3.so.0"          # GTK loader, alongside DT_NEEDED libgtk-3.so.0
+  "libpulse.so.0"          # audio output
+  "libGL.so.1"             # GPU compositing
   "libEGL.so.1"
   "libGLESv2.so.2"
-  "libvulkan.so.1" # Vulkan backend
-  "libva.so.2" # VA-API hardware video decode
+  "libvulkan.so.1"         # Vulkan backend
+  "libva.so.2"             # VA-API hardware video decode
   "libva-drm.so.2"
-  "libpci.so.3" # GPU enumeration
-  "libgssapi_krb5.so.2" # SPNEGO / Negotiate auth
-  "libdbusmenu-glib.so.4" # tray menus
-  "libspeechd.so.2" # accessibility TTS
-  "libuuid.so.1"
-  "libXtst.so.6"
+  "libpci.so.3"            # GPU enumeration
+  "libgssapi_krb5.so.2"    # SPNEGO / Negotiate auth
+  "libdbusmenu-glib.so.4"  # tray menus
+  "libspeechd.so.2"        # accessibility TTS
+  "libnssckbi.so"          # NSS builtin trust roots
   "libXcursor.so.1"
   "libX11-xcb.so.1"
   "libxcb-dri3.so.0"
@@ -269,24 +314,63 @@ dlopenSonames = [
   "libxcb-present.so.0"
   "libxcb-sync.so.1"
 ];
+
+# Held to the resolve assertion but exempt from the reference assertion:
+# upstream's `Depends` lists them, so runtimeLibs keeps providing them,
+# but no string in any shipped ELF names them (rechecked at 1.24012.9).
+dlopenSonamesDependsOnly = [
+  "libuuid.so.1"
+  "libXtst.so.6"
+];
+
+# Named by the payload and deliberately NOT provided. Every entry is a
+# conscious "no" with a reason; anything named by the payload and absent
+# from all three lists fails the guard.
+dlopenSonamesUnprovided = [ /* 25 entries, grouped by reason */ ];
 ```
 
-**Why these:** every entry is a soname string-scanned out of the main
-executable during the A2 investigation — the same scan `runtimeLibs` was
-derived from. Nothing was guessed or added. They are restricted to the class
-whose absence *degrades silently* rather than crashing, which is exactly what a
-green build cannot catch: `dlopen` returning NULL is a feature quietly
-switching itself off, not a link error.
+**What the reference assertion found immediately.** The original wrote that
+"every entry is a soname string-scanned out of the main executable during the
+A2 investigation". At `1.24012.9`, four of the twenty-two entries no longer
+match that description:
 
-`libsecret-1.so.0` is the one that motivated the check: lose it and os_crypt
-falls back from a keyring-derived **v11** key to the hardcoded-password **v10**
-path, so the session token stops being protected while everything still appears
-to work.
+| Entry | Named by the payload? | Disposition |
+| --- | --- | --- |
+| `libva.so.2` | as `libva.so` | ABI version is appended at runtime, so an unversioned stem counts as a reference |
+| `libva-drm.so.2` | as `libva-drm.so` | same |
+| `libuuid.so.1` | **no** — no string in any shipped ELF, and no `DT_NEEDED` entry | moved to `dlopenSonamesDependsOnly`: upstream's `Depends` lists it, so `runtimeLibs` keeps providing it, but the guard no longer claims a reference it cannot show |
+| `libXtst.so.6` | **no** — same | same |
 
-**Deliberately excluded:** `libnotify.so.1` and `libnotify.so.5`. Both appear
-in the A2 string scan, but the binary probes several libnotify versions in turn
-and needs only one; nixpkgs ships `.so.4`. Asserting the others would fail for
-no reason. Empirically confirmed before excluding them:
+Whether those two were ever dlopen'd or were only ever `Depends` entries, the
+old check could not tell the difference and the old report asserted the
+stronger claim. The new one records what is actually observable.
+
+**What the novelty assertion forced.** Its first run surfaced 35 soname
+strings that were neither `DT_NEEDED`, bundled, nor listed anywhere:
+
+- **8** are unversioned aliases of sonames the package already provides or
+  waives (`libGL.so` beside `libGL.so.1`, and so on) — matched by stem, since
+  the binary probes both spellings. A *versioned* string never matches this
+  way, so a future bump to `libnotify.so.9` still fails rather than passing on
+  the strength of `libnotify.so.4`.
+- **2** resolve from the RUNPATH today and are now asserted rather than waived:
+  `libgdk-3.so.0` (from gtk3, beside the `DT_NEEDED` `libgtk-3.so.0`) and
+  `libnssckbi.so` (from nss, beside `libnss3.so`). Both were satisfied only as a side
+  effect of gtk3 and nss being in the closure for other reasons; they are now
+  checked on purpose.
+- **25** are waived by name in `dlopenSonamesUnprovided`, grouped with the
+  reason: probe alternates the binary tries in turn (`libnotify.so.1/.5`,
+  Heimdal `libgssapi.so.*`, `libgtk-4.so.1`, `libunity.so.*`), libraries that
+  come from the impure driver link and cannot exist in a build sandbox
+  (`libGLX_nvidia.so.0`, `libvulkan_{intel,radeon,freedreno}.so`), glibc's own
+  NSS modules, optional Google components upstream fetches at runtime
+  (`libsoda.so`, the three `libLiteRt*`), crashpad's libcurl transport,
+  RenderDoc, and two sonames named only by the bundled SwiftShader.
+
+`libnotify.so.1` / `libnotify.so.5` remain excluded for the reason the original
+gave — the binary probes several libnotify versions and needs one, nixpkgs
+ships `.so.4` — but they are now excluded *by name in a list the guard reads*,
+rather than by omission:
 
 ```
   RESOLVES   libnotify.so.4
@@ -294,87 +378,114 @@ no reason. Empirically confirmed before excluding them:
   MISSING    libnotify.so.5
 ```
 
-The check additionally rejects an empty RUNPATH element — the `DT_RUNPATH`
-analogue of the `LD_LIBRARY_PATH` bug fixed in `2a915f0`.
+The check also still rejects an empty RUNPATH element — the `DT_RUNPATH`
+analogue of the `LD_LIBRARY_PATH` bug fixed in `0652904` — and now does so for
+every shipped ELF rather than the main executable alone.
 
-### 3. Negative test — FAILS on a deliberately broken RUNPATH (verbatim)
+### 3. Negative tests — one per assertion (verbatim)
 
-`libsecret` was removed from `runtimeLibs` (line 122 replaced with a marker
-comment), the check re-run, then the file restored from backup.
+Each was produced by editing `pkgs/claude-desktop.nix`, running the check, and
+restoring the file from a backup. Exit codes were measured without a pipe.
 
-```
-122:    # DELIBERATELY REMOVED FOR NEGATIVE TEST
---- running check with libsecret dropped from runtimeLibs ---
-claude-desktop-dlopen-runpath>   FAIL    libsecret-1.so.0         unresolvable from RUNPATH
-claude-desktop-dlopen-runpath>   ok      libnotify.so.4           -> /nix/store/c4cad93fv7d0gzcvsjpqp5l8kw092ypi-libnotify-0.8.8/lib
-claude-desktop-dlopen-runpath>   ok      libgdk_pixbuf-2.0.so.0   -> /nix/store/pd9mmvahvhr3jiirllrn7csvg8v03ahx-gdk-pixbuf-2.44.6/lib
-claude-desktop-dlopen-runpath>   ok      libpulse.so.0            -> /nix/store/q429js3mm3j3skjz9wx3m8rdv1qf84vl-libpulseaudio-17.0/lib
-claude-desktop-dlopen-runpath>   ok      libGL.so.1               -> /nix/store/v8x5c24y4zgxv5xmwhz5lz26ir816c31-libglvnd-1.7.0/lib
-claude-desktop-dlopen-runpath>   ok      libEGL.so.1              -> /nix/store/v8x5c24y4zgxv5xmwhz5lz26ir816c31-libglvnd-1.7.0/lib
-claude-desktop-dlopen-runpath>   ok      libGLESv2.so.2           -> /nix/store/v8x5c24y4zgxv5xmwhz5lz26ir816c31-libglvnd-1.7.0/lib
-claude-desktop-dlopen-runpath>   ok      libvulkan.so.1           -> /nix/store/ndqy5bfkf379dl13r5018c2p9xskcgwf-claude-desktop-1.24012.9/lib/claude-desktop
-claude-desktop-dlopen-runpath>   ok      libva.so.2               -> /nix/store/cjpydg8bqyffw0526ak3chpis931xvsv-libva-2.24.0/lib
-claude-desktop-dlopen-runpath>   ok      libva-drm.so.2           -> /nix/store/cjpydg8bqyffw0526ak3chpis931xvsv-libva-2.24.0/lib
-claude-desktop-dlopen-runpath>   ok      libpci.so.3              -> /nix/store/wr5s9c80k6fhpy3f452ha6cirw5c9d6c-pciutils-3.15.0/lib
-claude-desktop-dlopen-runpath>   ok      libgssapi_krb5.so.2      -> /nix/store/gh32nqhnvx2an8hdkb2z8z3kv405s226-krb5-1.22.2-lib/lib
-```
-
-Exit code, measured without a pipe (the earlier `CHECK EXIT=0` in the session
-was `head`'s status, not nix's):
+**RESOLVE** — `libsecret` removed from `runtimeLibs`:
 
 ```
-$ nix build .#checks.x86_64-linux.dlopen-runpath >/dev/null 2>&1; echo $?
-nix build exit code with broken RUNPATH: 1
+claude-desktop-dlopen-runpath>   FAIL    libsecret-1.so.0           unresolvable from RUNPATH
+...
+claude-desktop-dlopen-runpath>   ok      libsecret-1.so.0           named by lib/claude-desktop/claude-desktop
+error: Cannot build '/nix/store/kglj45ggsmv23rfl6jbqxfjnx29mczh2-claude-desktop-dlopen-runpath.drv'.
+
+RESOLVE (libsecret dropped from runtimeLibs): nix build exit code = 1
 ```
 
-Restore confirmed clean:
+Note the second line: the library is gone but the *reference* is still there,
+which is exactly how this failure looks in the field.
+
+**REFERENCE** — `libkrb5.so.3` added to `dlopenSonames`. It is in the closure
+(krb5 is already a `runtimeLibs` entry for `libgssapi_krb5.so.2`) but no
+shipped ELF names it, so it resolves and still fails — the two assertions are
+independent:
 
 ```
---- restoring ---
-122:    libsecret # libsecret-1.so.0   — safeStorage / os_crypt keyring
-(empty diff vs index = restored)
+claude-desktop-dlopen-runpath>   ok      libkrb5.so.3               -> /nix/store/gh32nqhnvx2an8hdkb2z8z3kv405s226-krb5-1.22.2-lib/lib
+claude-desktop-dlopen-runpath>   FAIL    libkrb5.so.3               no longer named by any shipped ELF
+
+REFERENCE (listed soname the payload never names): nix build exit code = 1
+```
+
+**NOVELTY** — one entry (`libsoda.so`) deleted from
+`dlopenSonamesUnprovided`, simulating a soname the payload names that nobody
+has classified:
+
+```
+claude-desktop-dlopen-runpath> == novelty: every soname string is classified
+claude-desktop-dlopen-runpath>   FAIL    libsoda.so                 unclassified, named by lib/claude-desktop/claude-desktop
+
+NOVELTY (a named soname left unclassified): nix build exit code = 1
+```
+
+All three print the same guidance block before exiting, which names the fix for
+each failure mode:
+
+```
+One or more assertions failed. Note what this does NOT look like at
+runtime: dlopen failure is not a link error, so the package still builds
+and still starts — the affected feature just switches itself off. For
+libsecret-1.so.0 that means the session token drops from a keyring-derived
+v11 key to v10 obfuscation.
+
+  unresolvable     the library left the closure, or the RUNPATH no longer
+                   reaches it. Fix runtimeLibs in pkgs/claude-desktop.nix.
+
+  no longer named  upstream stopped using it. Drop it from dlopenSonames
+                   (and from runtimeLibs if nothing else needs it), or move
+                   it to dlopenSonamesDependsOnly if the .deb still lists
+                   it in Depends.
+
+  unclassified     upstream started naming something new. Decide which it
+                   is: add it to runtimeLibs + dlopenSonames if this
+                   package should provide it, or to
+                   dlopenSonamesUnprovided with the reason if it should
+                   not.
 ```
 
 ### 4. Positive test — PASSES on HEAD (verbatim)
 
-```
-=== positive case: check on HEAD ===
-claude-desktop-dlopen-runpath> RUNPATH has 38 entries
-claude-desktop-dlopen-runpath>   ok      libsecret-1.so.0         -> /nix/store/xplgg6bnv5zglgrf3djibil77nr7b7qm-libsecret-0.21.7/lib
-claude-desktop-dlopen-runpath>   ok      libnotify.so.4           -> /nix/store/c4cad93fv7d0gzcvsjpqp5l8kw092ypi-libnotify-0.8.8/lib
-claude-desktop-dlopen-runpath>   ok      libgdk_pixbuf-2.0.so.0   -> /nix/store/pd9mmvahvhr3jiirllrn7csvg8v03ahx-gdk-pixbuf-2.44.6/lib
-claude-desktop-dlopen-runpath>   ok      libpulse.so.0            -> /nix/store/q429js3mm3j3skjz9wx3m8rdv1qf84vl-libpulseaudio-17.0/lib
-claude-desktop-dlopen-runpath>   ok      libGL.so.1               -> /nix/store/v8x5c24y4zgxv5xmwhz5lz26ir816c31-libglvnd-1.7.0/lib
-claude-desktop-dlopen-runpath>   ok      libEGL.so.1              -> /nix/store/v8x5c24y4zgxv5xmwhz5lz26ir816c31-libglvnd-1.7.0/lib
-claude-desktop-dlopen-runpath>   ok      libGLESv2.so.2           -> /nix/store/v8x5c24y4zgxv5xmwhz5lz26ir816c31-libglvnd-1.7.0/lib
-claude-desktop-dlopen-runpath>   ok      libvulkan.so.1           -> /nix/store/6nhncb2xssshqrfx20nydgvbcs5h4j19-claude-desktop-1.24012.9/lib/claude-desktop
-claude-desktop-dlopen-runpath>   ok      libva.so.2               -> /nix/store/cjpydg8bqyffw0526ak3chpis931xvsv-libva-2.24.0/lib
-claude-desktop-dlopen-runpath>   ok      libva-drm.so.2           -> /nix/store/cjpydg8bqyffw0526ak3chpis931xvsv-libva-2.24.0/lib
-claude-desktop-dlopen-runpath>   ok      libpci.so.3              -> /nix/store/wr5s9c80k6fhpy3f452ha6cirw5c9d6c-pciutils-3.15.0/lib
-claude-desktop-dlopen-runpath>   ok      libgssapi_krb5.so.2      -> /nix/store/gh32nqhnvx2an8hdkb2z8z3kv405s226-krb5-1.22.2-lib/lib
-claude-desktop-dlopen-runpath>   ok      libdbusmenu-glib.so.4    -> /nix/store/0c2m6gdnxxfh5k3xp1zxvmrby0r6qbr3-libdbusmenu-glib-16.04.0/lib
-claude-desktop-dlopen-runpath>   ok      libspeechd.so.2          -> /nix/store/xbjhaipy3ddlhllz0bcily2k8brwkfml-speech-dispatcher-0.12.1/lib
-claude-desktop-dlopen-runpath>   ok      libuuid.so.1             -> /nix/store/m4q3a226wx3qjd3yrmwv2q0rzsjqf5zg-util-linux-2.42.2-lib/lib
-claude-desktop-dlopen-runpath>   ok      libXtst.so.6             -> /nix/store/sn84f2wa25q1f0qvq2c1x5sbr6gp8qgy-libxtst-1.2.5/lib
-claude-desktop-dlopen-runpath>   ok      libXcursor.so.1          -> /nix/store/nbmch0g2bi2rjpfxvyi056j21f2l1pkr-libxcursor-1.2.3/lib
-claude-desktop-dlopen-runpath>   ok      libX11-xcb.so.1          -> /nix/store/45naqds5dkzsmmrh61wbxbfci73san7n-libx11-1.8.13/lib
-claude-desktop-dlopen-runpath>   ok      libxcb-dri3.so.0         -> /nix/store/2chpcgwndk5iphqgwf9r7x4yjysmkd2z-libxcb-1.17.0/lib
-claude-desktop-dlopen-runpath>   ok      libxcb-glx.so.0          -> /nix/store/2chpcgwndk5iphqgwf9r7x4yjysmkd2z-libxcb-1.17.0/lib
-claude-desktop-dlopen-runpath>   ok      libxcb-present.so.0      -> /nix/store/2chpcgwndk5iphqgwf9r7x4yjysmkd2z-libxcb-1.17.0/lib
-claude-desktop-dlopen-runpath>   ok      libxcb-sync.so.1         -> /nix/store/2chpcgwndk5iphqgwf9r7x4yjysmkd2z-libxcb-1.17.0/lib
-exit=0
-```
-
-22/22 resolve. Both checks are exposed and build:
+Abridged only where marked; the resolve block is 24 consecutive `ok` lines of
+the same shape.
 
 ```
-=== checks exposed by the flake ===
-  dlopen-runpath
-  wrapper-flags
+scanned 14 ELF objects, 93 distinct soname strings
 
-=== both build ===
-  both ok
+== resolve: provided sonames, from the main executable's RUNPATH
+  ok      libsecret-1.so.0           -> /nix/store/xplgg6bnv5zglgrf3djibil77nr7b7qm-libsecret-0.21.7/lib
+  ok      libnotify.so.4             -> /nix/store/c4cad93fv7d0gzcvsjpqp5l8kw092ypi-libnotify-0.8.8/lib
+  ok      libgdk-3.so.0              -> /nix/store/sfipg5lg6yrzvhh4lafialb5sqnk5pvx-gtk+3-3.24.52/lib
+  ok      libvulkan.so.1             -> /nix/store/6nhncb2xssshqrfx20nydgvbcs5h4j19-claude-desktop-1.24012.9/lib/claude-desktop
+  ok      libnssckbi.so              -> /nix/store/s0h8ra4wcl1nbxracs4hm4qc6czllx6y-nss-3.112.5/lib
+  [17 further ok lines elided]
+  ok      libuuid.so.1               -> /nix/store/m4q3a226wx3qjd3yrmwv2q0rzsjqf5zg-util-linux-2.42.2-lib/lib
+  ok      libXtst.so.6               -> /nix/store/sn84f2wa25q1f0qvq2c1x5sbr6gp8qgy-libxtst-1.2.5/lib
+
+== resolve: and from the RUNPATH of every other object that names them
+  ok      5 further (object, soname) pairs resolve
+
+== reference: provided sonames are still named by the payload
+  ok      libsecret-1.so.0           named by lib/claude-desktop/claude-desktop
+  ok      libgdk-3.so.0              named by lib/claude-desktop/claude-desktop
+  ok      libva.so.2                 named as libva.so (ABI version appended at runtime)
+  ok      libva-drm.so.2             named as libva-drm.so (ABI version appended at runtime)
+  ok      libnssckbi.so              named by lib/claude-desktop/claude-desktop
+  [17 further ok lines elided]
+  n/a     libuuid.so.1               Depends-only, not expected in the scan
+  n/a     libXtst.so.6               Depends-only, not expected in the scan
+
+== novelty: every soname string is classified
+  ok      all 93 classified (DT_NEEDED, bundled, provided or waived)
 ```
+
+24/24 resolve, 22/22 still referenced, 93/93 classified. `nix flake check`
+passes with both checks built.
 
 ### 5. Where it is wired into the updater
 
@@ -396,27 +507,45 @@ exit=0
           nix build .#checks.x86_64-linux.dlopen-runpath -L
 ```
 
-### GAP — why D3 is PARTIAL
+### GAP — closed, and the one inference that remains
 
-**Requirement 5 is only half-proven.** What is proven: the check exits `1` on a
-broken RUNPATH (measured above), the step exists, it carries
-`set -euo pipefail`, and every later step — including
-`peter-evans/create-pull-request` — is gated on `steps.bump.outputs.changed`
-with Actions' implicit `success()`, so a failure here cannot reach PR creation.
-
-What is **not** proven: the workflow has never actually executed. This repo has
-no git remote —
+The original gap was that the workflow had never executed: the repo had no git
+remote, so "a bump fails loudly" rested entirely on a local exit code plus
+Actions' documented gating semantics. **That is closed.** The repo has a remote,
+and the updater has run end to end on a real bump — run `30801047214`,
+2026-08-03, a `workflow_dispatch` from
+`claude/ci-maintenance-update-workflow` with `sources.json` pinned one release
+back specifically to exercise the bump path:
 
 ```
-=== remotes ===
-(empty above = no remote configured)
+Bump sources.json      hash verified:  sha256-MC5tII3YyOnlIGfaoo7zsRcaFhNYb9DhC+3GQiJbbuE=
+                       version=1.24012.9
+                       changed=true
+Build the new version  success
+Guard - dlopen'd libraries still resolve from RUNPATH
+                       building '/nix/store/dsrhgv38wvfkfckcv7g5c9cvsyqf1wqd-claude-desktop-dlopen-runpath.drv'...
+                       claude-desktop-dlopen-runpath> RUNPATH has 38 entries
+                       claude-desktop-dlopen-runpath>   ok  libsecret-1.so.0  -> …-libsecret-0.21.7/lib
+                       (22 ok lines, step green)
+Run flake checks       success
+Open pull request      pull-request-operation = none
 ```
 
-— so no CI run exists, and "a bump fails loudly" is an inference from the local
-exit code plus Actions' documented gating semantics, not an observation. It
-becomes real evidence the first time the workflow runs against a genuine
-upstream bump. Closing this needs a push and one real (or manually dispatched)
-run; it cannot be closed locally.
+So the gated steps do run in order on a real bump, and the guard executes
+against a freshly built package in CI rather than only on this laptop. Two
+honest footnotes on that run: the guard it exercised was the pre-review
+version (the rewrite in this PR has been run locally, not yet in CI), and
+`pull-request-operation = none` because the branch bumped to the version `dev`
+already carried, so there was nothing to open a PR about.
+
+**What remains an inference:** no CI run has yet had the guard *fail*, so "a
+failing guard blocks PR creation" is still read off `if:` semantics rather than
+observed. Every element of it has been measured separately — the check exits
+`1` (three ways, above), the step is not `continue-on-error`, and every later
+step carries an `if:` that Actions ANDs with an implicit `success()` — but the
+composition has not been watched end to end. Forcing that would mean landing a
+deliberately broken guard on `dev` to watch a scheduled run go red, which costs
+more than it proves.
 
 ---
 
@@ -424,8 +553,32 @@ run; it cannot be closed locally.
 
 ### Verdict
 
-**The SNI host owns this behaviour — it is neither this package's nor
-upstream Claude's.**
+**Nothing in this package or its closure explains the behaviour. Which
+component *does* own it was not established.**
+
+What the evidence below supports:
+
+- the tray item registers with the watcher and is live, alongside working
+  applets — so this is not a packaging failure;
+- the closure is not missing an appindicator library. Electron 42 /
+  Chromium 148 uses its own native SNI and needs none; `libdbusmenu-glib` is
+  present, so the menu path is provisioned;
+- the app advertises `ItemIsMenu = false` — it does not declare itself
+  menu-only — and an `Activate` call against its object returns success.
+
+What it does **not** support, and the original verdict asserted anyway: that
+the SNI host owns the behaviour. `Activate` returning `0` proves the method
+exists and did not error; it does not prove the app raises the window rather
+than opening a menu or doing nothing, because nobody watched the screen while
+that call was made. No real left click was ever traced either, so neither
+waybar nor upstream Claude is excluded. Naming waybar would have pointed the
+next debugging session at a component that may have nothing to do with it.
+
+**What would settle it:** watch the session bus during a genuine left click —
+`dbus-monitor` filtered on the item's object path — and record whether the host
+emits `Activate`, `ContextMenu`, or nothing, then what the app does in
+response. That measurement was never taken; driving a GUI click was out of
+scope for this phase.
 
 ### Evidence
 
@@ -451,7 +604,7 @@ alongside working tray applets:
   (other registered tray applets redacted)
 ```
 
-**3. It advertises left-click activation and implements it:**
+**3. It advertises left-click activation, and the method is callable:**
 
 ```
 === SNI properties ===
@@ -488,21 +641,19 @@ Waybar's tray config is default — `icon-size` and `spacing` only, no click
 mapping — so whatever it does with a left click is waybar 0.15.0's built-in
 handling.
 
-### Important caveat on what this proves
+### Where the evidence stops
 
 `ItemIsMenu = false` proves **what the application advertises**, not **what the
 host honours**. A host is free to bind left-click to the context menu
 regardless of that property, and nothing in the SNI spec compels it to call
 `Activate`. So the evidence rules out "the app declared itself menu-only" and
-"the app has no Activate" as explanations; it does not, by itself, establish
-what waybar actually does on click.
+"the app has no `Activate`" as explanations; it does not establish what waybar
+actually does on click, nor what the app does when `Activate` arrives.
 
-Related limit: **I never observed an actual left-click.** The reported
+Related limit: **no actual left-click was ever observed.** The reported
 behaviour ("clicking the tray icon opens a context menu") is your observation,
-not something I reproduced — driving a GUI click was out of scope. If you want
-that nailed down, the next step is instrumenting waybar or watching the bus for
-an `Activate` call during a real click, and the target is waybar, not this
-flake.
+not something reproduced here. Waybar's tray config being default narrows where
+a click mapping *could* come from, but "default config" is not a trace.
 
 ### UPower note — environmental, not packaging
 
@@ -531,8 +682,11 @@ failing silently behind the scenes.
 Open items across phases A–D, including things flagged in passing that never
 got a response.
 
-1. **D3 requirement 5 — the updater guard has never run in CI.** No git remote
-   exists, so the workflow has never executed. See the D3 gap section.
+1. ~~**D3 requirement 5 — the updater guard has never run in CI.**~~ **Closed.**
+   The repo has a remote and the updater has run end to end on a real bump
+   (run `30801047214`), guard step included and green. What is still an
+   inference rather than an observation is that a *failing* guard blocks PR
+   creation — see the D3 gap section for exactly which parts were measured.
 2. **`suidSandbox = true` has never been runtime-tested.** B3's variant was
    verified only structurally (bundled helper absent, `CHROME_DEVEL_SANDBOX`
    set in the wrapper, builds clean). No host without a usable namespace
@@ -540,8 +694,13 @@ got a response.
    relies on *was* measured directly (`setuid_sandbox_host.cc:166` vs `:156`),
    but end-to-end it is unproven.
 3. **The leaked Chrome Safe Storage key is still in the transcript.** Not
-   deleted, per instruction. Rotation is your call; it is a local OSCrypt key
-   for Chrome, not for Claude.
+   deleted, per instruction. It is **Google Chrome's** OSCrypt key
+   (`application=chrome`), not Claude Desktop's (`application=Claude`) — the
+   original stated that as a bare assertion and review rightly challenged it;
+   the measurement is now under D1, *"Which key it is"*. Rotate it anyway: it
+   decrypts Chrome's own cookie and password stores on this host. Rotating
+   means deleting that keyring item — Chrome mints a fresh key on next launch,
+   and anything sealed with the old one stops being readable.
 4. **`~/.config/Claude` was never snapshotted *before* it was polluted.** The
    earliest checksum I hold was taken in D2, i.e. after the early Phase A/B
    launches had already rotated cookies. The D2 isolation prevents further
@@ -562,9 +721,12 @@ got a response.
 8. **arm64 remains unimplemented** (explicit non-goal). `TODO(arm64)` markers
    are in `flake.nix` and `pkgs/claude-desktop.nix`; upstream ships arm64 at
    version parity.
-9. **`PHASE-D-REPORT.md` is untracked** at the time of writing — this file was
-   created as a reporting deliverable and has not been committed, since the
-   task specified no code or repo changes.
+9. ~~**`PHASE-D-REPORT.md` is untracked**~~ **Closed** by `bc1b793`, which
+   committed this file (sanitized) as part of PR #1.
+10. **The rewritten D3 guard has not itself run in CI yet.** The run that
+    closed gap 1 exercised the pre-review version. The rewrite passes locally,
+    fails locally in all three directions, and will first run in CI on the next
+    scheduled bump.
 
 Phase C is **closed, not a gap**: you selected option 2 (one `/goal` per
 phase), so the proposed goal-text change was never needed and no hook config
@@ -574,14 +736,15 @@ was touched.
 
 ## Commits
 
-Phase B and Phase D landed in two commits. (`4753550` predates both and is
-listed for continuity.)
+SHAs are the ones on `dev` (the earlier draft of this table quoted pre-rebase
+hashes that no longer exist).
 
 | SHA | What landed |
 | --- | --- |
-| `2a915f0` | **Phase B.** Confirmed v11 keyring path (B0); removed the empty `LD_LIBRARY_PATH` element, then dropped the variable entirely in favour of `DT_RUNPATH` via `appendRunpaths` (B2a/B2b); added the `suidSandbox` option with the default output unchanged (B3); `set -euo pipefail` in every workflow `run:` block, closing the `\| tee` swallow (B5); README on the Secret Service requirement and Cowork's real state (B1/B4). |
-| `b8a465f` | **Phase D.** Added `checks.dlopen-runpath` with the soname list in `passthru.dlopenSonames`, wired it into the updater as its own named step (D3); documented profile snapshotting and the throwaway `XDG_CONFIG_HOME` test invocation in the README (D2). |
-| `4753550` | *(Phase 0–2, for context.)* Initial packaging of the official Linux `.deb`: derivation, FHS variant, overlay, daily updater workflow. |
+| `0652904` | **Phase B.** Confirmed v11 keyring path (B0); removed the empty `LD_LIBRARY_PATH` element, then dropped the variable entirely in favour of `DT_RUNPATH` via `appendRunpaths` (B2a/B2b); added the `suidSandbox` option with the default output unchanged (B3); `set -euo pipefail` in every workflow `run:` block, closing the `\| tee` swallow (B5); README on the Secret Service requirement and Cowork's real state (B1/B4). |
+| `687cbd7` | **Phase D.** Added `checks.dlopen-runpath` with the soname list in `passthru.dlopenSonames`, wired it into the updater as its own named step (D3); documented profile snapshotting and the throwaway `XDG_CONFIG_HOME` test invocation in the README (D2). |
+| `bc1b793` | This report, sanitized. |
+| *(this commit)* | **Review response.** Rewrote the D3 guard around a scan of the shipped ELFs — resolve, reference and novelty assertions — in `pkgs/dlopen-runpath.nix`; split the soname list into provided / Depends-only / deliberately-unprovided; corrected the D4 verdict and this report's D3 and gap-3 claims. |
+| `a769a22` | *(Phase 0–2, for context.)* Initial packaging of the official Linux `.deb`: derivation, FHS variant, overlay, daily updater workflow. |
 
-D1 and D4 produced no commits — both were investigations, and D4's verdict was
-that nothing in this repo owns the behaviour.
+D1 and D4 produced no code commits — both were investigations.

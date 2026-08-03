@@ -313,25 +313,30 @@ stdenv.mkDerivation (finalAttrs: {
     inherit (source) url;
     updateScript = ./update.sh;
 
-    # Consumed by checks.dlopen-runpath. Every entry is a soname the main
-    # executable dlopen()s (string-scanned out of the binary — the same list
-    # runtimeLibs is derived from), restricted to those whose absence
-    # *degrades silently* instead of crashing. That is precisely the class a
-    # green build cannot catch: dlopen returning NULL is a feature quietly
-    # switching itself off, not a link error.
+    # ---- consumed by checks.dlopen-runpath ------------------------------
     #
-    # libsecret-1.so.0 is the one that matters most: lose it and os_crypt
-    # falls back from a keyring-derived v11 key to the hardcoded-password
-    # v10 path, i.e. the session token silently stops being protected while
-    # everything still appears to work.
+    # The guard rescans the shipped ELFs for soname-shaped strings on every
+    # run and reconciles the scan against these three lists, so a list that
+    # stops describing the binary fails instead of quietly passing. Between
+    # them they must account for every soname the payload names that is not
+    # already covered by DT_NEEDED (autoPatchelfHook's job) or bundled with
+    # the app.
     #
-    # Deliberately NOT listed: libnotify.so.1 / libnotify.so.5. The binary
-    # probes several libnotify versions in turn and only needs one; nixpkgs
-    # ships .so.4. Asserting the others would fail for no reason.
+    # Sonames this package is responsible for providing: named by a shipped
+    # ELF, covered by no DT_NEEDED entry, and required to resolve from the
+    # RUNPATH of the object that opens them.
+    #
+    # libsecret-1.so.0 is the one that motivated the guard: lose it and
+    # os_crypt falls back from a keyring-derived v11 key to the
+    # hardcoded-password v10 path, i.e. the session token silently stops being
+    # protected while everything still appears to work. Most of the others
+    # fail the same way — dlopen returns NULL and a feature switches itself
+    # off — which is exactly the class a green build cannot catch.
     dlopenSonames = [
       "libsecret-1.so.0" # os_crypt keyring -> v11 vs v10
       "libnotify.so.4" # desktop notifications
       "libgdk_pixbuf-2.0.so.0" # image loading
+      "libgdk-3.so.0" # GTK loader, alongside DT_NEEDED libgtk-3.so.0
       "libpulse.so.0" # audio output
       "libGL.so.1" # GPU compositing
       "libEGL.so.1"
@@ -343,14 +348,74 @@ stdenv.mkDerivation (finalAttrs: {
       "libgssapi_krb5.so.2" # SPNEGO / Negotiate auth
       "libdbusmenu-glib.so.4" # tray menus
       "libspeechd.so.2" # accessibility TTS
-      "libuuid.so.1"
-      "libXtst.so.6"
+      "libnssckbi.so" # NSS builtin trust roots
       "libXcursor.so.1"
       "libX11-xcb.so.1"
       "libxcb-dri3.so.0"
       "libxcb-glx.so.0"
       "libxcb-present.so.0"
       "libxcb-sync.so.1"
+    ];
+
+    # Held to the resolve assertion but exempt from the reference assertion:
+    # upstream's `Depends` lists them, so runtimeLibs keeps providing them,
+    # but no string in any shipped ELF names them (rechecked at 1.24012.9).
+    # Keeping them here asserts they stay reachable without claiming a
+    # reference the scan cannot show.
+    dlopenSonamesDependsOnly = [
+      "libuuid.so.1"
+      "libXtst.so.6"
+    ];
+
+    # Named by the payload and deliberately NOT provided. Every entry is a
+    # conscious "no" with a reason; anything named by the payload and absent
+    # from all three lists fails the guard, so an upstream bump that starts
+    # dlopen()ing something new cannot pass unnoticed.
+    dlopenSonamesUnprovided = [
+      # Probe alternates: the binary tries several sonames for one feature and
+      # uses whichever it finds. The one we do provide is in dlopenSonames.
+      "libnotify.so.1" # provided: libnotify.so.4
+      "libnotify.so.5"
+      "libgssapi.so.1" # Heimdal; provided: MIT libgssapi_krb5.so.2
+      "libgssapi.so.2"
+      "libgssapi.so.4"
+      "libgtk-4.so.1" # GTK4; the payload links GTK3 (DT_NEEDED)
+      "libunity.so.4" # Ubuntu Unity launcher API; no such desktop
+      "libunity.so.6"
+      "libunity.so.9"
+
+      # Supplied by the impure driver link (addDriverRunpath, last RUNPATH
+      # entry) at runtime, never by the closure — nothing to assert in a
+      # sandboxed build.
+      "libGLX_nvidia.so.0"
+      "libvulkan_intel.so"
+      "libvulkan_radeon.so"
+      "libvulkan_freedreno.so"
+
+      # glibc's own name-service modules; they ship with libc, not with us.
+      "libnss_compat.so.2"
+      "libnss_files.so.2"
+
+      # Optional Google components upstream fetches at runtime; nixpkgs
+      # packages none of them, and absent they are simply unavailable.
+      "libsoda.so" # on-device speech
+      "libLiteRtGpuAccelerator.so"
+      "libLiteRtVulkanAccelerator.so"
+      "libLiteRtWebGpuAccelerator.so"
+
+      # Crash-upload transport, named only by chrome_crashpad_handler. No
+      # crash server is configured, so the transport is never constructed.
+      "libcurl.so.4"
+      "libcurl-gnutls.so.4"
+      "libcurl-nss.so.4"
+
+      # Injected by hand when someone is debugging a GPU capture.
+      "librenderdoc.so"
+
+      # Named only by the bundled SwiftShader (software Vulkan) for its own
+      # window-system integration, not by the app.
+      "libwayland-client.so.0"
+      "libxcb-shm.so.0"
     ];
   };
 
