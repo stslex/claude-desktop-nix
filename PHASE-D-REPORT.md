@@ -26,7 +26,7 @@ under measurement, and now carries the evidence it should have had:
   which is exactly what makes them easy to confuse. The claim stands; the proof
   is now in D1.
 
-Two further review rounds on the rewrite found four more holes in the guard,
+Three further review rounds on the rewrite found six more holes in the guard,
 all now closed and described in D3. Round two: `DT_NEEDED` was classified
 globally rather than per object, so one object could dlopen a soname only
 another object links with nothing checking it could reach it; and a waiver
@@ -35,7 +35,12 @@ keyed by soname alone, so a waiver written for one binary excused every other
 binary that started naming the same soname; and the unversioned-stem fallback
 was a blanket rule, so dropping `libnotify.so.1` while `libnotify.so` remained
 would have kept the stale entry alive. Waivers are now object-scoped and the
-stem rule is gone, replaced by a declared alias table.
+stem rule is gone, replaced by declared spelling tables. Round four: a second
+spelling that sits *beside* an exact soname was still being accepted as proof
+that the exact one was still named, and `$ORIGIN` in a RUNPATH was tested as a
+literal directory rather than resolved against the object — the first would
+have let a waiver go stale unnoticed, the second would have failed a bump that
+works at runtime.
 
 The D3 gap is separately closed: the workflow has since run in CI on a real
 bump. All of this is detailed in the sections below.
@@ -295,8 +300,15 @@ about the main executable suddenly probing for it, so waivers are scoped to
 the object that earned them.
 
 **No stem matching.** An unversioned spelling counts as a reference to a
-versioned soname only where `passthru.dlopenSonamesAliases` declares it, one
-alias to one target. The blanket rule it replaced was leaky in both
+versioned soname only where `passthru.dlopenSonamesRuntimeVersioned` declares
+it, one spelling to one target — and only there. The six entries in
+`dlopenSonamesSecondSpellings` classify their string and make it inherit the
+target's waiver or provision, but they never stand in as *proof*, because the
+exact string is present today: `libcurl.so` disappearing from crashpad is
+nothing, `libcurl.so.4` disappearing is news. Measured at 1.24012.9: every
+second-spelling target is named exactly by at least one object, while
+`libva.so.2` and `libva-drm.so.2` are named by none — which is what puts them
+in different tables. The blanket rule they replaced was leaky in both
 directions: it would have accepted `libnotify.so` as evidence that a dropped
 `libnotify.so.1` probe was still alive, and — measured, not hypothesised — it
 had been silently *waiving* `libnotify.so` in the reachability pass, on the
@@ -374,11 +386,18 @@ dlopenSonamesUnprovided = {
   ];
 };
 
-# Unversioned spellings the payload also carries, and the soname each
-# stands for. The only way an inexact string can satisfy a reference.
-dlopenSonamesAliases = {
-  "libva.so" = "libva.so.2";           # version appended at runtime
-  "libva-drm.so" = "libva-drm.so.2";   # likewise
+# The versioned string never appears; the binary appends the ABI version
+# at runtime. The unversioned form is the only evidence there is, so it
+# *does* stand in for an exact reference.
+dlopenSonamesRuntimeVersioned = {
+  "libva.so" = "libva.so.2";
+  "libva-drm.so" = "libva-drm.so.2";
+};
+
+# Spellings the payload carries *in addition to* the exact soname. They
+# classify the string and inherit the target's waiver or provision, but
+# never count as proof that the exact string is still named.
+dlopenSonamesSecondSpellings = {
   "libGL.so" = "libGL.so.1";
   "libcurl.so" = "libcurl.so.4";
   "libdbusmenu-glib.so" = "libdbusmenu-glib.so.4";
@@ -408,11 +427,12 @@ stronger claim. The new one records what is actually observable.
 strings that were neither `DT_NEEDED`, bundled, nor listed anywhere:
 
 - **8** are unversioned spellings of sonames the package already provides or
-  waives (`libGL.so` beside `libGL.so.1`, and so on). These are now declared
-  one by one in `dlopenSonamesAliases`; the stem-matching rule that used to
-  cover them was removed in the third review round, because a blanket rule
-  cannot tell "the binary spells it both ways" from "the versioned probe is
-  gone and only the generic string is left".
+  waives (`libGL.so` beside `libGL.so.1`, and so on). These are declared one by
+  one, split across two tables by whether the exact string exists elsewhere in
+  the payload; the stem-matching rule that used to cover them was removed in
+  the third review round, because a blanket rule cannot tell "the binary spells
+  it both ways" from "the versioned probe is gone and only the generic string
+  is left".
 - **2** resolve from the RUNPATH today and are now asserted rather than waived:
   `libgdk-3.so.0` (from gtk3, beside the `DT_NEEDED` `libgtk-3.so.0`) and
   `libnssckbi.so` (from nss, beside `libnss3.so`). Both were satisfied only as a side
@@ -553,7 +573,50 @@ Under the stem rule this passed, because `libnotify.so` is the stem of
 `libnotify.so.9` as much as of `libnotify.so.4`. That ambiguity is what the
 one-alias-one-target table removes.
 
-All seven print the same guidance block before exiting, which names the fix for
+**SPELLING CLASS** — the fourth round's first case. Demoting `libva.so` from
+`dlopenSonamesRuntimeVersioned` to `dlopenSonamesSecondSpellings`, i.e.
+claiming the exact string exists when it does not, with `libva-drm` left alone
+as the control:
+
+```
+  FAIL    libva.so.2                 no longer named by any shipped ELF
+  ok      libva-drm.so.2             named as libva-drm.so (version appended at runtime)
+
+  nix build exit code = 1
+```
+
+Same payload, same two libraries, opposite results — which is the whole point
+of the split. A second spelling standing beside an exact string proves nothing
+about that string, so `libcurl.so` cannot vouch for a `libcurl.so.4` waiver
+that crashpad has stopped naming.
+
+**LOADER TOKENS** — the fourth round's second case, and the only finding so far
+that was about a *false failure* rather than a false pass. `libGLESv2.so`'s
+RUNPATH set to `$ORIGIN` on a copy of the output, where `libvulkan.so.1` sits
+in the same directory and is therefore genuinely reachable at runtime:
+
+```
+round-3 check (literal path test)         round-4 check ($ORIGIN expanded)
+  FAIL  libpci.so       …                   FAIL  libpci.so       …
+  FAIL  libGL.so.1      …                   FAIL  libGL.so.1      …
+  FAIL  libpci.so.3     …                   FAIL  libpci.so.3     …
+  FAIL  libvulkan.so    …                   FAIL  libvulkan.so    …
+  FAIL  libvulkan.so.1  …  <-- false        FAIL  libEGL.so.1     …
+  FAIL  libEGL.so.1     …
+```
+
+The five that fail in both really are unreachable — those store paths were
+removed from the RUNPATH. `libvulkan.so.1` is the difference: it is the one
+library sitting next to the object, and under the old literal test it would
+have blocked an automated bump for a package that works. Tokens the check does
+*not* model (`$LIB`, `$PLATFORM`) are refused by name rather than guessed at:
+
+```
+FAIL: unsupported loader token in RUNPATH of lib/claude-desktop/libGLESv2.so: $ORIGIN/../$LIB
+      only $ORIGIN is modelled; teach resolveIn the rest before trusting this
+```
+
+All nine print the same guidance block before exiting, which names the fix for
 each failure mode:
 
 ```
@@ -614,16 +677,17 @@ scanned 14 ELF objects, 93 distinct soname strings
   ok      libcurl.so.4               still named by lib/claude-desktop/chrome_crashpad_handler
   [23 further ok lines elided]
 
-== reference: declared aliases are still named by the payload
-  ok      libva.so                   stands for libva.so.2
-  [7 further ok lines elided]
+== reference: declared spellings are still named by the payload
+  ok      libva.so                   stands for libva.so.2 (version appended at runtime)
+  ok      libGL.so                   stands for libGL.so.1 (second spelling)
+  [6 further ok lines elided]
 
 == novelty: every soname string is classified
   ok      all 93 classified (DT_NEEDED, bundled, provided, waived, or a declared alias)
 ```
 
 24/24 resolve, 37 (object, soname) pairs reachable, 22/22 provided sonames,
-25/25 waivers and 8/8 aliases still named, 93/93 classified. `nix flake check` passes with both
+25/25 waivers and 8/8 declared spellings still named, 93/93 classified. `nix flake check` passes with both
 checks built.
 
 ### 5. Where it is wired into the updater

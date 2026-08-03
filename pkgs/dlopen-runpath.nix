@@ -84,9 +84,13 @@ runCommand "claude-desktop-dlopen-runpath"
         ) claude-desktop.dlopenSonamesUnprovided
       )
     );
-    # "<alias> <soname it stands for>" per line.
-    aliases = lib.concatStringsSep "\n" (
-      lib.mapAttrsToList (a: t: "${a} ${t}") claude-desktop.dlopenSonamesAliases
+    # "<spelling> <soname it stands for>" per line, in two tables: only the
+    # runtime-versioned one may stand in for an exact reference.
+    runtimeVersioned = lib.concatStringsSep "\n" (
+      lib.mapAttrsToList (a: t: "${a} ${t}") claude-desktop.dlopenSonamesRuntimeVersioned
+    );
+    secondSpellings = lib.concatStringsSep "\n" (
+      lib.mapAttrsToList (a: t: "${a} ${t}") claude-desktop.dlopenSonamesSecondSpellings
     );
   }
   ''
@@ -102,10 +106,21 @@ runCommand "claude-desktop-dlopen-runpath"
     rc=0
 
     # ALIAS[unversioned] = the soname it stands for. Declared, never inferred.
-    declare -A ALIAS=()
+    # SUBST is the subset allowed to stand in for an exact reference: only
+    # sonames whose version the binary appends at runtime, where the exact
+    # string genuinely does not exist. A second spelling that sits beside the
+    # exact string proves nothing about it — if the exact string disappears,
+    # that is the news the reference assertion exists to report.
+    declare -A ALIAS=() SUBST=()
+    while read -r a t; do
+      if [ -n "$a" ]; then
+        ALIAS["$a"]=$t
+        SUBST["$a"]=$t
+      fi
+    done <<< "$runtimeVersioned"
     while read -r a t; do
       if [ -n "$a" ]; then ALIAS["$a"]=$t; fi
-    done <<< "$aliases"
+    done <<< "$secondSpellings"
 
     # What a scanned string means: itself, or the soname it is an alias for.
     meaningOf() { echo "''${ALIAS[$1]-$1}"; }
@@ -136,7 +151,7 @@ runCommand "claude-desktop-dlopen-runpath"
     # anywhere in the payload", which is a global one. Collapsing the first
     # into the second would let object A dlopen a soname that only object B
     # links, with nothing checking that A can actually reach it.
-    declare -A RPATH=() SCANNED=() SEENIN=() NEEDED=() NEEDED_BY=() SONAME=() BUNDLED=()
+    declare -A RPATH=() RPATHX=() SCANNED=() SEENIN=() NEEDED=() NEEDED_BY=() SONAME=() BUNDLED=()
     elfs=()
 
     while IFS= read -r f; do
@@ -152,6 +167,11 @@ runCommand "claude-desktop-dlopen-runpath"
     for f in "''${elfs[@]}"; do
       rel=''${f#$app/}
       RPATH["$rel"]=$(patchelf --print-rpath "$f" 2>/dev/null || true)
+      # $ORIGIN is the directory of the object being loaded, so it has to be
+      # expanded per object, exactly as the loader does. [$] keeps the token
+      # out of this file as a literal that Nix would try to interpolate.
+      RPATHX["$rel"]=$(printf '%s' "''${RPATH[$rel]}" \
+        | sed -e "s|[$]{ORIGIN}|$(dirname "$f")|g" -e "s|[$]ORIGIN|$(dirname "$f")|g")
       SONAME["$rel"]=$(patchelf --print-soname "$f" 2>/dev/null || true)
       while IFS= read -r s; do
         SCANNED["$s"]=1
@@ -166,9 +186,12 @@ runCommand "claude-desktop-dlopen-runpath"
     echo "scanned ''${#elfs[@]} ELF objects, ''${#SCANNED[@]} distinct soname strings"
 
     # Echoes the RUNPATH directory a soname resolves from, or returns 1.
+    # Reads the $ORIGIN-expanded form: an object reaching a bundled library
+    # through an origin-relative entry resolves at runtime and must not be
+    # reported as unreachable here.
     resolveIn() { # $1 = path relative to $app, $2 = soname
       local dirs d
-      IFS=: read -ra dirs <<< "''${RPATH[$1]-}"
+      IFS=: read -ra dirs <<< "''${RPATHX[$1]-}"
       for d in "''${dirs[@]}"; do
         if [ -n "$d" ] && [ -e "$d/$2" ]; then echo "$d"; return 0; fi
       done
@@ -185,6 +208,16 @@ runCommand "claude-desktop-dlopen-runpath"
         case ":''${RPATH[$rel]}:" in
           *::*)
             echo "FAIL: empty RUNPATH element in $rel (resolves to the cwd)"
+            rc=1
+            ;;
+        esac
+        # $ORIGIN is expanded above. Any other loader token ($LIB, $PLATFORM)
+        # would have to be guessed at, and a guess here is worse than a stop:
+        # say so instead of silently resolving against a made-up directory.
+        case "''${RPATHX[$rel]}" in
+          *'$'*)
+            echo "FAIL: unsupported loader token in RUNPATH of $rel: ''${RPATH[$rel]}"
+            echo "      only \$ORIGIN is modelled; teach resolveIn the rest before trusting this"
             rc=1
             ;;
         esac
@@ -256,13 +289,13 @@ runCommand "claude-desktop-dlopen-runpath"
         printf '  ok      %-26s named by %s\n' "$s" "''${SEENIN[$s]%% *}"
         continue
       fi
-      # A declared alias, and only a declared alias, may stand in for it.
+      # Only a runtime-versioned spelling may stand in for it.
       via=""
-      for a in "''${!ALIAS[@]}"; do
-        if [ "''${ALIAS[$a]}" = "$s" ] && [ -n "''${SCANNED[$a]-}" ]; then via=$a; break; fi
+      for a in "''${!SUBST[@]}"; do
+        if [ "''${SUBST[$a]}" = "$s" ] && [ -n "''${SCANNED[$a]-}" ]; then via=$a; break; fi
       done
       if [ -n "$via" ]; then
-        printf '  ok      %-26s named as %s (declared alias)\n' "$s" "$via"
+        printf '  ok      %-26s named as %s (version appended at runtime)\n' "$s" "$via"
       else
         printf '  FAIL    %-26s no longer named by any shipped ELF\n' "$s"
         rc=1
@@ -279,11 +312,12 @@ runCommand "claude-desktop-dlopen-runpath"
     # that does matter. Only dependsOnly is exempt from having to be named.
     echo
     echo "== reference: waivers are still named by the object they were written for"
-    namedBy() { # $1 = object, $2 = soname; exact string or a declared alias for it
+    namedBy() { # $1 = object, $2 = soname; the exact string, or a spelling
+                # whose version the binary composes at runtime
       case " ''${SEENIN[$2]-} " in *" $1 "*) return 0 ;; esac
       local a
-      for a in "''${!ALIAS[@]}"; do
-        if [ "''${ALIAS[$a]}" = "$2" ]; then
+      for a in "''${!SUBST[@]}"; do
+        if [ "''${SUBST[$a]}" = "$2" ]; then
           case " ''${SEENIN[$a]-} " in *" $1 "*) return 0 ;; esac
         fi
       done
@@ -300,15 +334,19 @@ runCommand "claude-desktop-dlopen-runpath"
       fi
     done
 
-    # The alias table is an assertion too: an alias nothing names is a rule
+    # The spelling tables are assertions too: an entry nothing names is a rule
     # about a string that no longer exists.
     echo
-    echo "== reference: declared aliases are still named by the payload"
+    echo "== reference: declared spellings are still named by the payload"
     for a in $(printf '%s\n' "''${!ALIAS[@]}" | sort); do
       if [ -n "''${SCANNED[$a]-}" ]; then
-        printf '  ok      %-26s stands for %s\n' "$a" "''${ALIAS[$a]}"
+        if [ -n "''${SUBST[$a]-}" ]; then
+          printf '  ok      %-26s stands for %s (version appended at runtime)\n' "$a" "''${ALIAS[$a]}"
+        else
+          printf '  ok      %-26s stands for %s (second spelling)\n' "$a" "''${ALIAS[$a]}"
+        fi
       else
-        printf '  FAIL    %-26s stale alias: no longer named by any shipped ELF\n' "$a"
+        printf '  FAIL    %-26s stale spelling: no longer named by any shipped ELF\n' "$a"
         rc=1
       fi
     done

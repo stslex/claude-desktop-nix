@@ -431,19 +431,28 @@ stdenv.mkDerivation (finalAttrs: {
       ];
     };
 
-    # Unversioned spellings the payload also carries, and the soname each one
-    # stands for. Only a declared alias may satisfy a reference in place of
-    # the exact string — the guard does no stem-matching of its own, because a
-    # blanket "libfoo.so counts as libfoo.so.N" rule would let a dropped
-    # probe (libnotify.so.1 going away while libnotify.so stays) look alive,
-    # which is the failure the reference assertion exists to catch.
+    # Sonames whose ABI version the binary appends at runtime: the versioned
+    # string never appears in the payload at all, so the unversioned spelling
+    # is the only evidence there is, and it *does* stand in for the exact
+    # string when the guard asks "is this soname still named". Verified at
+    # 1.24012.9: neither libva.so.2 nor libva-drm.so.2 appears in any shipped
+    # ELF, while both unversioned forms do.
+    dlopenSonamesRuntimeVersioned = {
+      "libva.so" = "libva.so.2";
+      "libva-drm.so" = "libva-drm.so.2";
+    };
+
+    # Unversioned spellings the payload carries *in addition to* the exact
+    # soname — the binary names both. These classify the string and make it
+    # inherit the versioned soname's provision or waiver, but they are never
+    # accepted as proof that the versioned soname is still named: the exact
+    # string is right there today, so if it disappears that is real news and
+    # not something the generic spelling should paper over.
     #
-    # Two kinds live here. libva/libva-drm genuinely assemble the ABI version
-    # at runtime, so the unversioned string is the only one in the binary. The
-    # rest are second spellings that sit beside the versioned string.
-    dlopenSonamesAliases = {
-      "libva.so" = "libva.so.2"; # version appended at runtime
-      "libva-drm.so" = "libva-drm.so.2"; # likewise
+    # Verified at 1.24012.9: every target below is named exactly by at least
+    # one shipped ELF. If that ever stops being true, the entry belongs in
+    # dlopenSonamesRuntimeVersioned instead — and the guard will say so.
+    dlopenSonamesSecondSpellings = {
       "libGL.so" = "libGL.so.1";
       "libcurl.so" = "libcurl.so.4";
       "libdbusmenu-glib.so" = "libdbusmenu-glib.so.4";
