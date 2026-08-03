@@ -26,7 +26,7 @@ under measurement, and now carries the evidence it should have had:
   which is exactly what makes them easy to confuse. The claim stands; the proof
   is now in D1.
 
-Fourteen further review rounds on the rewrite found nineteen more holes in the
+Fifteen further review rounds on the rewrite found twenty-one more holes in the
 guard, all now closed and described in D3. Round two: `DT_NEEDED` was classified
 globally rather than per object, so one object could dlopen a soname only
 another object links with nothing checking it could reach it; and a waiver
@@ -78,7 +78,12 @@ path of the lot, the provided sonames themselves, whose reference assertion was
 still satisfied by a bare scan hit. Round fifteen closed the last soname-only
 path anywhere in the guard: novelty classified a waived soname payload-wide, so
 a second object naming it — and able to resolve it — needed no decision, which
-is exactly what the per-object waiver contract promises it will demand.
+is exactly what the per-object waiver contract promises it will demand. Round
+sixteen left the evidence machinery alone and found two things either side of
+it: the structural check rejected only *empty* RUNPATH elements, when `.` or
+`lib` name the working directory just as surely; and an object's own
+`DT_SONAME` was not classified, so a shared object shipped under a filename
+like `plugin.node` would have been reported as an unknown soname.
 
 The D3 gap is separately closed: the workflow has since run in CI on a real
 bump. All of this is detailed in the sections below.
@@ -932,8 +937,33 @@ about the object that probes for it.
 That is every assertion and every table on the same footing: per object where
 the fact is per object, payload-wide where it genuinely is.
 
-All twenty-two print the same guidance block before exiting, which names the fix
-for each failure mode:
+**TWO AT THE EDGES.** Neither is about evidence; both are about the assertions
+either side of it.
+
+*A relative RUNPATH element is the same bug as an empty one.* The structural
+check had rejected only the empty component — the `DT_RUNPATH` analogue of the
+`LD_LIBRARY_PATH` bug fixed in `0652904` — but `.` or `lib` or `../x` are
+resolved against the process working directory just as surely, and a later
+absolute entry that happens to satisfy every soname does not make that safe:
+whatever sits in the cwd is searched first. Every component must now be
+absolute after `$ORIGIN` expansion.
+
+*An object's own soname is a name the payload declares.* `BUNDLED` only sees
+filenames matching `lib*.so*`, so a shared object shipped as `plugin.node` with
+`DT_SONAME=libplugin.so.1` had its own soname in its own strings, exempt from
+reachability and unclassified by novelty — a false failure blocking a valid
+bump. Declared sonames are classified now; a *different* object naming one
+still has to prove it can load it, because a declared soname is not a file.
+
+```
+                              round-15 check                      round-16 check
+  RUNPATH ". :/nix/store/…"     (silent)                            FAIL: relative RUNPATH element '.'
+  plugin.node, libplugin.so.1   FAIL  unclassified for              ok  all 94 classified
+                                      lib/…/resources/plugin.node
+```
+
+All twenty-four print the same guidance block before exiting, which names the
+fix for each failure mode:
 
 ```
 One or more assertions failed. Note what this does NOT look like at

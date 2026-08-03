@@ -373,6 +373,24 @@ runCommand "claude-desktop-dlopen-runpath"
             rc=1
             ;;
         esac
+        # An empty element is only the most obvious way to name the working
+        # directory. "." or "lib" or "../x" are resolved by the loader relative
+        # to the process cwd just the same, and a later absolute entry that
+        # happens to satisfy every soname does not make that safe: whatever
+        # sits in the cwd is searched first. Every component, after $ORIGIN
+        # expansion, has to be absolute.
+        IFS=: read -ra rpDirs <<< "''${RPATHX[$rel]}"
+        for d in "''${rpDirs[@]}"; do
+          if [ -n "$d" ]; then
+            case "$d" in
+              /*) ;;
+              *)
+                echo "FAIL: relative RUNPATH element '$d' in $rel (resolved against the cwd at load time)"
+                rc=1
+                ;;
+            esac
+          fi
+        done
         # $ORIGIN is expanded above. Any other loader token ($LIB, $PLATFORM)
         # would have to be guessed at, and a guess here is worse than a stop:
         # say so instead of silently resolving against a made-up directory.
@@ -597,6 +615,15 @@ runCommand "claude-desktop-dlopen-runpath"
     for s in $provided $dependsOnly "''${!NEEDED[@]}" "''${!BUNDLED[@]}" "''${!ALIAS[@]}"; do
       KNOWN["$s"]=1
     done
+    # An object's own DT_SONAME is a name this payload declares for itself, and
+    # it appears in that object's strings whatever the file is called. BUNDLED
+    # only sees filenames matching lib*.so*, so a shared object shipped as
+    # plugin.node with DT_SONAME=libplugin.so.1 would otherwise be reported as
+    # an unclassified soname. Reachability still makes any *other* object that
+    # names it prove it can load it — a declared soname is not a file.
+    for rel in "''${!SONAME[@]}"; do
+      if [ -n "''${SONAME[$rel]}" ]; then KNOWN["''${SONAME[$rel]}"]=1; fi
+    done
 
     unknown=()
     for s in "''${!SCANNED[@]}"; do
@@ -609,7 +636,7 @@ runCommand "claude-desktop-dlopen-runpath"
     done
 
     if [ ''${#unknown[@]} -eq 0 ]; then
-      echo "  ok      all ''${#SCANNED[@]} classified (DT_NEEDED, bundled, provided, a declared spelling, or waived for the object naming it)"
+      echo "  ok      all ''${#SCANNED[@]} classified (DT_NEEDED, bundled or declared as a shipped object's soname, provided, a declared spelling, or waived for the object naming it)"
     else
       # read, not a $(...) loop: the pairs are tab-separated and word
       # splitting would tear them in half.
