@@ -39,12 +39,26 @@
 # v10 from v11, none of which exist in the build sandbox, and it would be slow
 # and flaky in exchange for testing the same property this resolves directly.
 #
+# Two pieces of bookkeeping make the assertions per-object rather than
+# per-soname, which is where the earlier revisions of this file were wrong:
+#
+#   * DT_NEEDED is recorded per object. Object B linking a library says
+#     nothing about whether object A, which merely names it, can reach it.
+#   * waivers are recorded per object. "crashpad probes for libcurl and we
+#     ship no crash server" is a claim about crashpad; the same soname named
+#     by the main executable is a new fact and fails.
+#
+# There is no stem matching. An unversioned spelling counts as a reference to
+# a versioned soname only when passthru.dlopenSonamesAliases declares it, one
+# alias to one target — a blanket rule would let a dropped probe
+# (libnotify.so.1 going away while libnotify.so stays) look alive, which is
+# exactly what the reference assertion exists to catch.
+#
 # Limits of the scan, stated rather than papered over: it is a string scan, so
-# a soname assembled at runtime is invisible to it (libva is the live example —
-# the binary carries "libva.so" and appends the ABI version, which is why an
-# unversioned stem counts as a reference), a string can be present without any
-# code path reaching the dlopen, and only ELF objects are scanned — nothing
-# inside app.asar is.
+# a soname assembled at runtime is only visible through its unversioned
+# spelling (libva is the live example, hence the alias), a string can be
+# present without any code path reaching the dlopen, and only ELF objects are
+# scanned — nothing inside app.asar is.
 {
   lib,
   runCommand,
@@ -62,7 +76,18 @@ runCommand "claude-desktop-dlopen-runpath"
     app = claude-desktop;
     provided = lib.concatStringsSep " " claude-desktop.dlopenSonames;
     dependsOnly = lib.concatStringsSep " " claude-desktop.dlopenSonamesDependsOnly;
-    unprovided = lib.concatStringsSep " " claude-desktop.dlopenSonamesUnprovided;
+    # "<object> <soname>" per line.
+    unprovided = lib.concatStringsSep "\n" (
+      lib.concatLists (
+        lib.mapAttrsToList (
+          obj: sonames: map (s: "${obj} ${s}") sonames
+        ) claude-desktop.dlopenSonamesUnprovided
+      )
+    );
+    # "<alias> <soname it stands for>" per line.
+    aliases = lib.concatStringsSep "\n" (
+      lib.mapAttrsToList (a: t: "${a} ${t}") claude-desktop.dlopenSonamesAliases
+    );
   }
   ''
     set -euo pipefail
@@ -74,26 +99,32 @@ runCommand "claude-desktop-dlopen-runpath"
     # Anything shaped like a soname: libfoo.so, libfoo.so.1, libfoo-2.0.so.0.
     sonameRe='\blib[A-Za-z0-9_+.-]*\.so(\.[0-9]+)*\b'
 
-    # libfoo.so.1 -> libfoo.so ; libfoo.so -> libfoo.so
-    stemOf() { case "$1" in *.so.*) echo "''${1%%.so.*}.so" ;; *) echo "$1" ;; esac; }
-
     rc=0
 
-    # Sonames named by the payload that this package deliberately does not
-    # provide, plus their unversioned aliases. Kept separate from the rest of
-    # the classification because "we decided not to ship this" is the one
-    # answer that also exempts a soname from having to resolve.
-    declare -A WAIVED=() WAIVEDSTEM=()
-    for s in $unprovided; do
-      WAIVED["$s"]=1
-      WAIVEDSTEM["$(stemOf "$s")"]=1
-    done
+    # ALIAS[unversioned] = the soname it stands for. Declared, never inferred.
+    declare -A ALIAS=()
+    while read -r a t; do
+      if [ -n "$a" ]; then ALIAS["$a"]=$t; fi
+    done <<< "$aliases"
 
-    isWaived() {
-      if [ -n "''${WAIVED[$1]-}" ]; then return 0; fi
-      case "$1" in
-        *.so) if [ -n "''${WAIVEDSTEM[$1]-}" ]; then return 0; fi ;;
-      esac
+    # What a scanned string means: itself, or the soname it is an alias for.
+    meaningOf() { echo "''${ALIAS[$1]-$1}"; }
+
+    # WAIVED["<object> <soname>"] — deliberately not provided, for that object
+    # only. "We decided not to ship this" is the one answer that also exempts
+    # a soname from having to resolve, so it must not be granted payload-wide
+    # on the strength of one binary.
+    declare -A WAIVED=()
+    waiverPairs=()
+    while read -r obj s; do
+      if [ -n "$obj" ]; then
+        WAIVED["$obj $s"]=1
+        waiverPairs+=("$obj $s")
+      fi
+    done <<< "$unprovided"
+
+    isWaivedFor() { # $1 = object, $2 = scanned string
+      if [ -n "''${WAIVED[$1 $(meaningOf "$2")]-}" ]; then return 0; fi
       return 1
     }
 
@@ -184,8 +215,10 @@ runCommand "claude-desktop-dlopen-runpath"
     #   DT_NEEDED    of *this* object — the build would already have failed if
     #                it were unsatisfiable, and libc and friends resolve via
     #                the patched interpreter's own path rather than a RUNPATH.
-    #   waived       we decided not to provide it at all, which is the one
-    #                answer that also excuses it from resolving.
+    #   waived       *this object's* waiver list says we decided not to
+    #                provide it, which is the one answer that also excuses it
+    #                from resolving. A waiver granted to another object does
+    #                not carry over.
     echo
     echo "== reachability: each named soname resolves from the RUNPATH of the object naming it"
     pairs=0
@@ -202,7 +235,7 @@ runCommand "claude-desktop-dlopen-runpath"
             continue
             ;;
         esac
-        if isWaived "$s"; then
+        if isWaivedFor "$rel" "$s"; then
           skipped=$((skipped + 1))
           continue
         fi
@@ -213,17 +246,23 @@ runCommand "claude-desktop-dlopen-runpath"
         fi
       done
     done
-    echo "  ok      $pairs (object, soname) pairs resolve; $skipped exempt (own soname, that object's DT_NEEDED, or waived)"
+    echo "  ok      $pairs (object, soname) pairs resolve; $skipped exempt (own soname, that object's DT_NEEDED, or waived for that object)"
 
     # ------------------------------------------------------ 2. REFERENCE
     echo
     echo "== reference: provided sonames are still named by the payload"
     for s in $provided; do
-      stem=$(stemOf "$s")
       if [ -n "''${SCANNED[$s]-}" ]; then
         printf '  ok      %-26s named by %s\n' "$s" "''${SEENIN[$s]%% *}"
-      elif [ -n "''${SCANNED[$stem]-}" ]; then
-        printf '  ok      %-26s named as %s (ABI version appended at runtime)\n' "$s" "$stem"
+        continue
+      fi
+      # A declared alias, and only a declared alias, may stand in for it.
+      via=""
+      for a in "''${!ALIAS[@]}"; do
+        if [ "''${ALIAS[$a]}" = "$s" ] && [ -n "''${SCANNED[$a]-}" ]; then via=$a; break; fi
+      done
+      if [ -n "$via" ]; then
+        printf '  ok      %-26s named as %s (declared alias)\n' "$s" "$via"
       else
         printf '  FAIL    %-26s no longer named by any shipped ELF\n' "$s"
         rc=1
@@ -233,19 +272,43 @@ runCommand "claude-desktop-dlopen-runpath"
       printf '  n/a     %-26s Depends-only, not expected in the scan\n' "$s"
     done
 
-    # A waiver is a claim about the payload too — "this soname is named and we
-    # choose not to provide it". Once upstream stops naming it the claim is
-    # stale, and a stale waiver is worse than a missing one: it silently
+    # A waiver is a claim about one object — "this binary names the soname and
+    # we choose not to provide it". Once that object stops naming it the claim
+    # is stale, and a stale waiver is worse than a missing one: it silently
     # pre-approves the soname if a later release reintroduces it for something
     # that does matter. Only dependsOnly is exempt from having to be named.
     echo
-    echo "== reference: waivers are still named by the payload"
-    for s in $unprovided; do
-      stem=$(stemOf "$s")
-      if [ -n "''${SCANNED[$s]-}" ] || [ -n "''${SCANNED[$stem]-}" ]; then
-        printf '  ok      %-26s still named\n' "$s"
+    echo "== reference: waivers are still named by the object they were written for"
+    namedBy() { # $1 = object, $2 = soname; exact string or a declared alias for it
+      case " ''${SEENIN[$2]-} " in *" $1 "*) return 0 ;; esac
+      local a
+      for a in "''${!ALIAS[@]}"; do
+        if [ "''${ALIAS[$a]}" = "$2" ]; then
+          case " ''${SEENIN[$a]-} " in *" $1 "*) return 0 ;; esac
+        fi
+      done
+      return 1
+    }
+    for pair in "''${waiverPairs[@]}"; do
+      obj=''${pair%% *}
+      s=''${pair#* }
+      if namedBy "$obj" "$s"; then
+        printf '  ok      %-26s still named by %s\n' "$s" "$obj"
       else
-        printf '  FAIL    %-26s stale waiver: no longer named by any shipped ELF\n' "$s"
+        printf '  FAIL    %-26s stale waiver: %s no longer names it\n' "$s" "$obj"
+        rc=1
+      fi
+    done
+
+    # The alias table is an assertion too: an alias nothing names is a rule
+    # about a string that no longer exists.
+    echo
+    echo "== reference: declared aliases are still named by the payload"
+    for a in $(printf '%s\n' "''${!ALIAS[@]}" | sort); do
+      if [ -n "''${SCANNED[$a]-}" ]; then
+        printf '  ok      %-26s stands for %s\n' "$a" "''${ALIAS[$a]}"
+      else
+        printf '  FAIL    %-26s stale alias: no longer named by any shipped ELF\n' "$a"
         rc=1
       fi
     done
@@ -253,29 +316,22 @@ runCommand "claude-desktop-dlopen-runpath"
     # -------------------------------------------------------- 3. NOVELTY
     echo
     echo "== novelty: every soname string is classified"
-    declare -A KNOWN=() KNOWNSTEM=()
-    for s in $provided $dependsOnly $unprovided "''${!NEEDED[@]}" "''${!BUNDLED[@]}"; do
+    declare -A KNOWN=()
+    for s in $provided $dependsOnly "''${!NEEDED[@]}" "''${!BUNDLED[@]}" "''${!ALIAS[@]}"; do
       KNOWN["$s"]=1
-      KNOWNSTEM["$(stemOf "$s")"]=1
+    done
+    for pair in "''${waiverPairs[@]}"; do
+      KNOWN["''${pair#* }"]=1
     done
 
     unknown=()
     for s in "''${!SCANNED[@]}"; do
       if [ -n "''${KNOWN[$s]-}" ]; then continue; fi
-      # An unversioned string is covered by a known soname with the same stem:
-      # upstream probes "libfoo.so" alongside "libfoo.so.N". A *versioned*
-      # string must be listed explicitly, or a bump that starts probing
-      # libfoo.so.9 would sail past on the strength of libfoo.so.4.
-      case "$s" in
-        *.so)
-          if [ -n "''${KNOWNSTEM[$s]-}" ]; then continue; fi
-          ;;
-      esac
       unknown+=("$s")
     done
 
     if [ ''${#unknown[@]} -eq 0 ]; then
-      echo "  ok      all ''${#SCANNED[@]} classified (DT_NEEDED, bundled, provided or waived)"
+      echo "  ok      all ''${#SCANNED[@]} classified (DT_NEEDED, bundled, provided, waived, or a declared alias)"
     else
       for s in $(printf '%s\n' "''${unknown[@]}" | sort); do
         printf '  FAIL    %-26s unclassified, named by %s\n' "$s" "''${SEENIN[$s]%% *}"

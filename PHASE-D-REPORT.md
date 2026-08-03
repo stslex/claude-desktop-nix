@@ -26,12 +26,16 @@ under measurement, and now carries the evidence it should have had:
   which is exactly what makes them easy to confuse. The claim stands; the proof
   is now in D1.
 
-A **second review round** on the rewrite found two more holes in the guard,
-both now closed and described in D3: `DT_NEEDED` was being classified globally
-rather than per object, so one object could dlopen a soname only another object
-links with nothing checking it could reach it; and a waiver could outlive the
-string that justified it, silently pre-approving that soname if a later release
-brought it back.
+Two further review rounds on the rewrite found four more holes in the guard,
+all now closed and described in D3. Round two: `DT_NEEDED` was classified
+globally rather than per object, so one object could dlopen a soname only
+another object links with nothing checking it could reach it; and a waiver
+could outlive the string that justified it. Round three: waivers were still
+keyed by soname alone, so a waiver written for one binary excused every other
+binary that started naming the same soname; and the unversioned-stem fallback
+was a blanket rule, so dropping `libnotify.so.1` while `libnotify.so` remained
+would have kept the stale entry alive. Waivers are now object-scoped and the
+stem rule is gone, replaced by a declared alias table.
 
 The D3 gap is separately closed: the workflow has since run in CI on a real
 bump. All of this is detailed in the sections below.
@@ -265,17 +269,19 @@ fresh scan of every ELF object in the output:
 | | Assertion | The regression it catches |
 | --- | --- | --- |
 | 1 | **RESOLVE** — every soname the package claims to provide resolves from the main executable's RUNPATH | the library leaves the closure, or the RUNPATH stops reaching it |
-| 1b | **REACHABILITY** — *every* (object, soname) pair the scan produced resolves from that object's own RUNPATH, exempting only the object's own `DT_SONAME`, its **own** `DT_NEEDED`, and deliberately unprovided sonames | object A dlopening something only object B links. `DT_NEEDED` is a per-object fact; a global union of it silently vouches for A on B's evidence |
-| 2 | **REFERENCE** — every soname the lists mention is still named by the payload, waivers included | upstream drops a dlopen and the entry becomes an assertion that passes forever while testing nothing; or a waiver goes stale and silently pre-approves a soname that later comes back for something that matters |
+| 1b | **REACHABILITY** — *every* (object, soname) pair the scan produced resolves from that object's own RUNPATH, exempting only the object's own `DT_SONAME`, its **own** `DT_NEEDED`, and sonames waived **for that object** | object A dlopening something only object B links, or something waived only because B probes for it. Both `DT_NEEDED` and a waiver are per-object facts; a global union of either vouches for A on B's evidence |
+| 2 | **REFERENCE** — every soname the lists mention is still named by the payload: provided sonames anywhere, waivers by the object they were written for, declared aliases anywhere | upstream drops a dlopen and the entry becomes an assertion that passes forever while testing nothing; or a waiver or alias goes stale and silently pre-approves a soname that later comes back for something that matters |
 | 3 | **NOVELTY** — every soname-shaped string in the payload is accounted for: `DT_NEEDED`, bundled with the app, provided by us, or waived by name with a reason | upstream *adds* a dlopen — which the others cannot see at all |
 
 Assertions (1b), (2) and (3) are what tie the lists to the binary. The original
 version had none of them, which is why its "the two cannot drift" claim was
 wrong: `dlopenSonames` sitting next to `runtimeLibs` is a convention for the
 person editing the file, and conventions are exactly what an upstream bump
-ignores. (1b) and the waiver half of (2) came out of the second review round —
-the first rewrite still classified `DT_NEEDED` globally and still let a waiver
-outlive the string that justified it.
+ignores. (1b) and the waiver half of (2) came out of the second review round — the
+first rewrite still classified `DT_NEEDED` globally and still let a waiver
+outlive the string that justified it. The third round removed the last two
+global assumptions: waivers are now keyed by `(object, soname)` rather than by
+soname, and there is no stem matching anywhere.
 
 The exemptions in (1b) are each per-object for a reason. An ELF's own
 `DT_SONAME` appears in its own strings. A soname in *this* object's
@@ -283,8 +289,20 @@ The exemptions in (1b) are each per-object for a reason. An ELF's own
 and `libc` and friends resolve through the patched interpreter's own search
 path rather than any RUNPATH, so demanding a RUNPATH hit for them would fail
 on a correct package. "We chose not to provide it" is the only other answer
-that excuses a soname from resolving, which is why the waiver list feeds this
-assertion too.
+that excuses a soname from resolving — and it is a claim about one binary.
+"crashpad probes for libcurl and no crash server is configured" says nothing
+about the main executable suddenly probing for it, so waivers are scoped to
+the object that earned them.
+
+**No stem matching.** An unversioned spelling counts as a reference to a
+versioned soname only where `passthru.dlopenSonamesAliases` declares it, one
+alias to one target. The blanket rule it replaced was leaky in both
+directions: it would have accepted `libnotify.so` as evidence that a dropped
+`libnotify.so.1` probe was still alive, and — measured, not hypothesised — it
+had been silently *waiving* `libnotify.so` in the reachability pass, on the
+grounds that it is the stem of the waived `libnotify.so.1`, even though it is
+the alias of `libnotify.so.4`, which this package does provide. Removing the
+rule moved that pair from "exempt" to "checked": 36 pairs became 37.
 
 It is still deliberately static — sonames are resolved against RUNPATH entries
 rather than by launching the app. An Xvfb launch check would be strictly worse
@@ -343,10 +361,31 @@ dlopenSonamesDependsOnly = [
   "libXtst.so.6"
 ];
 
-# Named by the payload and deliberately NOT provided. Every entry is a
-# conscious "no" with a reason; anything named by the payload and absent
-# from all three lists fails the guard.
-dlopenSonamesUnprovided = [ /* 25 entries, grouped by reason */ ];
+# Named by the payload and deliberately NOT provided, keyed by the
+# object that names it — a waiver is a claim about one binary, and does
+# not carry over to another that starts naming the same soname.
+dlopenSonamesUnprovided = {
+  "lib/claude-desktop/claude-desktop" = [ /* 20, grouped by reason */ ];
+  "lib/claude-desktop/chrome_crashpad_handler" = [
+    "libcurl.so.4" "libcurl-gnutls.so.4" "libcurl-nss.so.4"
+  ];
+  "lib/claude-desktop/libvk_swiftshader.so" = [
+    "libwayland-client.so.0" "libxcb-shm.so.0"
+  ];
+};
+
+# Unversioned spellings the payload also carries, and the soname each
+# stands for. The only way an inexact string can satisfy a reference.
+dlopenSonamesAliases = {
+  "libva.so" = "libva.so.2";           # version appended at runtime
+  "libva-drm.so" = "libva-drm.so.2";   # likewise
+  "libGL.so" = "libGL.so.1";
+  "libcurl.so" = "libcurl.so.4";
+  "libdbusmenu-glib.so" = "libdbusmenu-glib.so.4";
+  "libnotify.so" = "libnotify.so.4";
+  "libpci.so" = "libpci.so.3";
+  "libvulkan.so" = "libvulkan.so.1";
+};
 ```
 
 **What the reference assertion found immediately.** The original wrote that
@@ -356,7 +395,7 @@ match that description:
 
 | Entry | Named by the payload? | Disposition |
 | --- | --- | --- |
-| `libva.so.2` | as `libva.so` | ABI version is appended at runtime, so an unversioned stem counts as a reference |
+| `libva.so.2` | as `libva.so` | the ABI version is appended at runtime, so the unversioned spelling is declared as its alias |
 | `libva-drm.so.2` | as `libva-drm.so` | same |
 | `libuuid.so.1` | **no** — no string in any shipped ELF, and no `DT_NEEDED` entry | moved to `dlopenSonamesDependsOnly`: upstream's `Depends` lists it, so `runtimeLibs` keeps providing it, but the guard no longer claims a reference it cannot show |
 | `libXtst.so.6` | **no** — same | same |
@@ -368,11 +407,12 @@ stronger claim. The new one records what is actually observable.
 **What the novelty assertion forced.** Its first run surfaced 35 soname
 strings that were neither `DT_NEEDED`, bundled, nor listed anywhere:
 
-- **8** are unversioned aliases of sonames the package already provides or
-  waives (`libGL.so` beside `libGL.so.1`, and so on) — matched by stem, since
-  the binary probes both spellings. A *versioned* string never matches this
-  way, so a future bump to `libnotify.so.9` still fails rather than passing on
-  the strength of `libnotify.so.4`.
+- **8** are unversioned spellings of sonames the package already provides or
+  waives (`libGL.so` beside `libGL.so.1`, and so on). These are now declared
+  one by one in `dlopenSonamesAliases`; the stem-matching rule that used to
+  cover them was removed in the third review round, because a blanket rule
+  cannot tell "the binary spells it both ways" from "the versioned probe is
+  gone and only the generic string is left".
 - **2** resolve from the RUNPATH today and are now asserted rather than waived:
   `libgdk-3.so.0` (from gtk3, beside the `DT_NEEDED` `libgtk-3.so.0`) and
   `libnssckbi.so` (from nss, beside `libnss3.so`). Both were satisfied only as a side
@@ -476,7 +516,44 @@ claude-desktop-dlopen-runpath>   FAIL    libunity.so.42             stale waiver
 STALE WAIVER: nix build exit code = 1
 ```
 
-All five print the same guidance block before exiting, which names the fix for
+**WAIVER SCOPE** — the third review round's case: a waiver that belongs to a
+different binary. Moving crashpad's three libcurl entries onto the main
+executable's list, leaving the strings where they are:
+
+```
+== reachability: each named soname resolves from the RUNPATH of the object naming it
+  FAIL    libcurl.so.4               named by lib/claude-desktop/chrome_crashpad_handler, unresolvable from its RUNPATH
+  FAIL    libcurl.so                 named by lib/claude-desktop/chrome_crashpad_handler, unresolvable from its RUNPATH
+  FAIL    libcurl-gnutls.so.4        named by lib/claude-desktop/chrome_crashpad_handler, unresolvable from its RUNPATH
+  FAIL    libcurl-nss.so.4           named by lib/claude-desktop/chrome_crashpad_handler, unresolvable from its RUNPATH
+== reference: waivers are still named by the object they were written for
+  FAIL    libcurl.so.4               stale waiver: lib/claude-desktop/claude-desktop no longer names it
+  FAIL    libcurl-gnutls.so.4        stale waiver: lib/claude-desktop/claude-desktop no longer names it
+  FAIL    libcurl-nss.so.4           stale waiver: lib/claude-desktop/claude-desktop no longer names it
+
+  nix build exit code = 1
+```
+
+Both halves fire, from opposite directions: crashpad names sonames nothing
+waives *for it*, and the main executable holds waivers for strings it does not
+name. NOVELTY stays silent throughout — the sonames are still classified — which
+is why the scoping had to live in the other two assertions.
+
+**ALIAS STRICTNESS** — `libnotify.so.9` added as a waiver. Nothing names it;
+the generic `libnotify.so` is present but is declared as the alias of
+`libnotify.so.4`, so it cannot stand in:
+
+```
+  FAIL    libnotify.so.9             stale waiver: lib/claude-desktop/claude-desktop no longer names it
+
+  nix build exit code = 1
+```
+
+Under the stem rule this passed, because `libnotify.so` is the stem of
+`libnotify.so.9` as much as of `libnotify.so.4`. That ambiguity is what the
+one-alias-one-target table removes.
+
+All seven print the same guidance block before exiting, which names the fix for
 each failure mode:
 
 ```
@@ -520,7 +597,7 @@ scanned 14 ELF objects, 93 distinct soname strings
   ok      libXtst.so.6               -> /nix/store/sn84f2wa25q1f0qvq2c1x5sbr6gp8qgy-libxtst-1.2.5/lib
 
 == reachability: each named soname resolves from the RUNPATH of the object naming it
-  ok      36 (object, soname) pairs resolve; 114 exempt (own soname, that object's DT_NEEDED, or waived)
+  ok      37 (object, soname) pairs resolve; 113 exempt (own soname, that object's DT_NEEDED, or waived for that object)
 
 == reference: provided sonames are still named by the payload
   ok      libsecret-1.so.0           named by lib/claude-desktop/claude-desktop
@@ -532,17 +609,21 @@ scanned 14 ELF objects, 93 distinct soname strings
   n/a     libuuid.so.1               Depends-only, not expected in the scan
   n/a     libXtst.so.6               Depends-only, not expected in the scan
 
-== reference: waivers are still named by the payload
-  ok      libnotify.so.1             still named
-  ok      libgssapi.so.1             still named
+== reference: waivers are still named by the object they were written for
+  ok      libnotify.so.1             still named by lib/claude-desktop/claude-desktop
+  ok      libcurl.so.4               still named by lib/claude-desktop/chrome_crashpad_handler
   [23 further ok lines elided]
 
+== reference: declared aliases are still named by the payload
+  ok      libva.so                   stands for libva.so.2
+  [7 further ok lines elided]
+
 == novelty: every soname string is classified
-  ok      all 93 classified (DT_NEEDED, bundled, provided or waived)
+  ok      all 93 classified (DT_NEEDED, bundled, provided, waived, or a declared alias)
 ```
 
-24/24 resolve, 36 (object, soname) pairs reachable, 22/22 provided sonames and
-25/25 waivers still named, 93/93 classified. `nix flake check` passes with both
+24/24 resolve, 37 (object, soname) pairs reachable, 22/22 provided sonames,
+25/25 waivers and 8/8 aliases still named, 93/93 classified. `nix flake check` passes with both
 checks built.
 
 ### 5. Where it is wired into the updater

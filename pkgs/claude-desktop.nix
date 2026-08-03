@@ -367,56 +367,90 @@ stdenv.mkDerivation (finalAttrs: {
       "libXtst.so.6"
     ];
 
-    # Named by the payload and deliberately NOT provided. Every entry is a
-    # conscious "no" with a reason; anything named by the payload and absent
-    # from all three lists fails the guard, so an upstream bump that starts
-    # dlopen()ing something new cannot pass unnoticed.
-    dlopenSonamesUnprovided = [
-      # Probe alternates: the binary tries several sonames for one feature and
-      # uses whichever it finds. The one we do provide is in dlopenSonames.
-      "libnotify.so.1" # provided: libnotify.so.4
-      "libnotify.so.5"
-      "libgssapi.so.1" # Heimdal; provided: MIT libgssapi_krb5.so.2
-      "libgssapi.so.2"
-      "libgssapi.so.4"
-      "libgtk-4.so.1" # GTK4; the payload links GTK3 (DT_NEEDED)
-      "libunity.so.4" # Ubuntu Unity launcher API; no such desktop
-      "libunity.so.6"
-      "libunity.so.9"
+    # Named by the payload and deliberately NOT provided, keyed by the object
+    # that names it. Object-scoped rather than a flat list because a waiver is
+    # a statement about one binary's behaviour: "crashpad probes for libcurl
+    # and we ship no crash server" says nothing about the main executable
+    # suddenly probing for it. A soname waived here for object A is still a
+    # hard failure when object B names it.
+    #
+    # Every entry is a conscious "no" with a reason. Anything named by the
+    # payload and absent from all of these lists fails the guard, and a waiver
+    # whose object stops naming it fails too.
+    dlopenSonamesUnprovided = {
+      "lib/claude-desktop/claude-desktop" = [
+        # Probe alternates: the binary tries several sonames for one feature
+        # and uses whichever it finds. The one we do provide is in
+        # dlopenSonames.
+        "libnotify.so.1" # provided: libnotify.so.4
+        "libnotify.so.5"
+        "libgssapi.so.1" # Heimdal; provided: MIT libgssapi_krb5.so.2
+        "libgssapi.so.2"
+        "libgssapi.so.4"
+        "libgtk-4.so.1" # GTK4; the payload links GTK3 (DT_NEEDED)
+        "libunity.so.4" # Ubuntu Unity launcher API; no such desktop
+        "libunity.so.6"
+        "libunity.so.9"
 
-      # Supplied by the impure driver link (addDriverRunpath, last RUNPATH
-      # entry) at runtime, never by the closure — nothing to assert in a
-      # sandboxed build.
-      "libGLX_nvidia.so.0"
-      "libvulkan_intel.so"
-      "libvulkan_radeon.so"
-      "libvulkan_freedreno.so"
+        # Supplied by the impure driver link (addDriverRunpath, last RUNPATH
+        # entry) at runtime, never by the closure — nothing to assert in a
+        # sandboxed build.
+        "libGLX_nvidia.so.0"
+        "libvulkan_intel.so"
+        "libvulkan_radeon.so"
+        "libvulkan_freedreno.so"
 
-      # glibc's own name-service modules; they ship with libc, not with us.
-      "libnss_compat.so.2"
-      "libnss_files.so.2"
+        # glibc's own name-service modules; they ship with libc, not with us.
+        "libnss_compat.so.2"
+        "libnss_files.so.2"
 
-      # Optional Google components upstream fetches at runtime; nixpkgs
-      # packages none of them, and absent they are simply unavailable.
-      "libsoda.so" # on-device speech
-      "libLiteRtGpuAccelerator.so"
-      "libLiteRtVulkanAccelerator.so"
-      "libLiteRtWebGpuAccelerator.so"
+        # Optional Google components upstream fetches at runtime; nixpkgs
+        # packages none of them, and absent they are simply unavailable.
+        "libsoda.so" # on-device speech
+        "libLiteRtGpuAccelerator.so"
+        "libLiteRtVulkanAccelerator.so"
+        "libLiteRtWebGpuAccelerator.so"
 
-      # Crash-upload transport, named only by chrome_crashpad_handler. No
-      # crash server is configured, so the transport is never constructed.
-      "libcurl.so.4"
-      "libcurl-gnutls.so.4"
-      "libcurl-nss.so.4"
+        # Injected by hand when someone is debugging a GPU capture.
+        "librenderdoc.so"
+      ];
 
-      # Injected by hand when someone is debugging a GPU capture.
-      "librenderdoc.so"
+      # Crash-upload transport. No crash server is configured, so the
+      # transport is never constructed — a claim about this binary only.
+      "lib/claude-desktop/chrome_crashpad_handler" = [
+        "libcurl.so.4"
+        "libcurl-gnutls.so.4"
+        "libcurl-nss.so.4"
+      ];
 
-      # Named only by the bundled SwiftShader (software Vulkan) for its own
-      # window-system integration, not by the app.
-      "libwayland-client.so.0"
-      "libxcb-shm.so.0"
-    ];
+      # The bundled software-Vulkan driver's own window-system integration.
+      # The app itself names neither.
+      "lib/claude-desktop/libvk_swiftshader.so" = [
+        "libwayland-client.so.0"
+        "libxcb-shm.so.0"
+      ];
+    };
+
+    # Unversioned spellings the payload also carries, and the soname each one
+    # stands for. Only a declared alias may satisfy a reference in place of
+    # the exact string — the guard does no stem-matching of its own, because a
+    # blanket "libfoo.so counts as libfoo.so.N" rule would let a dropped
+    # probe (libnotify.so.1 going away while libnotify.so stays) look alive,
+    # which is the failure the reference assertion exists to catch.
+    #
+    # Two kinds live here. libva/libva-drm genuinely assemble the ABI version
+    # at runtime, so the unversioned string is the only one in the binary. The
+    # rest are second spellings that sit beside the versioned string.
+    dlopenSonamesAliases = {
+      "libva.so" = "libva.so.2"; # version appended at runtime
+      "libva-drm.so" = "libva-drm.so.2"; # likewise
+      "libGL.so" = "libGL.so.1";
+      "libcurl.so" = "libcurl.so.4";
+      "libdbusmenu-glib.so" = "libdbusmenu-glib.so.4";
+      "libnotify.so" = "libnotify.so.4";
+      "libpci.so" = "libpci.so.3";
+      "libvulkan.so" = "libvulkan.so.1";
+    };
   };
 
   meta = {

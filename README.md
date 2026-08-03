@@ -188,18 +188,23 @@ and KVM plumbing is out of scope.
 instead of trusting the hand-written list. It scans every shipped ELF for
 soname-shaped strings, then requires each string to be accounted for as
 `DT_NEEDED`, bundled with the app, provided by us (`passthru.dlopenSonames`),
-or waived by name with a reason (`passthru.dlopenSonamesUnprovided`) — and
-requires every `(object, soname)` pair to resolve from *that object's* RUNPATH,
-not merely from the main executable's. Being `DT_NEEDED` of one object says
-nothing about whether another can reach it.
+or waived with a reason (`passthru.dlopenSonamesUnprovided`) — and requires
+every `(object, soname)` pair to resolve from *that object's* RUNPATH, not
+merely from the main executable's. Both halves of that are per-object: being
+`DT_NEEDED` of one object says nothing about whether another can reach it, and
+a waiver ("crashpad probes for libcurl and we ship no crash server") is a claim
+about one binary, so the same soname named by another one is a fresh decision
+rather than a free pass.
 
 So a bump that starts `dlopen`ing something new fails the check with that
 soname named, rather than shipping a feature that silently does nothing; a bump
 that stops using one fails too, waivers included, so no entry can rot into an
 assertion that passes while testing nothing. It is a string scan, so it cannot
-see a soname assembled at runtime — `libva` is the live case, and why an
-unversioned stem such as `libva.so` counts as a reference for `libva.so.2` —
-and it reads ELF objects only, nothing inside `app.asar`.
+see a soname assembled at runtime — `libva` is the live case, and why
+`passthru.dlopenSonamesAliases` declares `libva.so` as the spelling that stands
+for `libva.so.2`. Those aliases are declared one by one rather than inferred
+from a stem, so dropping a versioned probe cannot hide behind the generic
+string. It reads ELF objects only, nothing inside `app.asar`.
 
 ## Updating
 
