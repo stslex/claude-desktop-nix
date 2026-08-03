@@ -455,7 +455,16 @@ runCommand "claude-desktop-dlopen-runpath"
         # mapped soname accepted as a fallback for second spellings, which the
         # binary tries alongside the exact name.
         if [ -n "''${RTV[$rel$'\t'$s]-}" ]; then
-          if ! resolveIn "$rel" "''${RTV[$rel$'\t'$s]}" >/dev/null; then
+          # The declaration says this object composes the version at runtime,
+          # which is a statement about a live call site. Take it only where the
+          # spelling is a mapped literal here: a prefix surviving in .dynstr or
+          # in debug metadata is not a probe, and substituting the versioned
+          # soname for it would check something nothing asks for.
+          if ! triesItself "$rel" "$s"; then
+            printf '  FAIL    %-26s declared in %s as composing its version, but no longer a live literal there\n' \
+              "$s" "$rel"
+            rc=1
+          elif ! resolveIn "$rel" "''${RTV[$rel$'\t'$s]}" >/dev/null; then
             printf '  FAIL    %-26s named by %s; its runtime soname %s is unresolvable from that RUNPATH\n' \
               "$s" "$rel" "''${RTV[$rel$'\t'$s]}"
             rc=1
@@ -541,11 +550,11 @@ runCommand "claude-desktop-dlopen-runpath"
     for pair in "''${rtvPairs[@]}"; do
       obj=''${pair%%$'\t'*}
       a=''${pair#*$'\t'}
-      if namesIt "$obj" "$a"; then
+      if triesItself "$obj" "$a"; then
         printf '  ok      %-26s stands for %s in %s (version appended at runtime)\n' \
           "$a" "''${RTV[$pair]}" "$obj"
       else
-        printf '  FAIL    %-26s stale spelling: %s no longer names it\n' "$a" "$obj"
+        printf '  FAIL    %-26s stale spelling: %s no longer names it as a live literal\n' "$a" "$obj"
         rc=1
       fi
     done

@@ -26,7 +26,7 @@ under measurement, and now carries the evidence it should have had:
   which is exactly what makes them easy to confuse. The claim stands; the proof
   is now in D1.
 
-Eleven further review rounds on the rewrite found sixteen more holes in the
+Twelve further review rounds on the rewrite found seventeen more holes in the
 guard, all now closed and described in D3. Round two: `DT_NEEDED` was classified
 globally rather than per object, so one object could dlopen a soname only
 another object links with nothing checking it could reach it; and a waiver
@@ -70,7 +70,10 @@ naming `libva.so` as an ordinary literal would have had `libva.so.2` checked on
 its behalf. Round twelve found the one path that never reached the
 mapped-literal gate — a spelling could inherit its target's waiver with no
 evidence that the object treats them as the same library, so a probe for the
-generic name was excused by a waiver on a name the object merely links.
+generic name was excused by a waiver on a name the object merely links. Round
+thirteen applied the same rule to the last place it was missing: a
+runtime-versioned declaration was honoured, and kept alive, on any occurrence of
+the prefix at all, including one surviving only in debug metadata.
 
 The D3 gap is separately closed: the workflow has since run in CI on a real
 bump. All of this is detailed in the sections below.
@@ -855,8 +858,30 @@ waiver is stale, because an object that *links* a library is not an object that
 probes for one we declined to provide — the build resolved it. Waiver staleness
 now takes the same literal evidence for the same reason.
 
-All nineteen print the same guidance block before exiting, which names the fix
-for each failure mode:
+**A DECLARATION HONOURED ON A DEAD STRING.** "This object composes the ABI
+version at runtime" is a statement about a live call site. It was being applied
+to any scanned occurrence of the prefix, and kept alive by any occurrence too —
+so a build that stopped composing the soname, while the prefix survived in debug
+metadata, would have passed every assertion and gone on satisfying the
+`libva.so.2` reference on nothing's behalf. An object whose only `libva.so` is
+in a `noload` section, with `libva.so.2` on its RUNPATH and the declaration
+made for it:
+
+```
+round-12 check                                    round-13 check
+  ok  libva.so  stands for libva.so.2 in            FAIL  libva.so  declared in lib/…/libvartv.so as
+      lib/…/libvartv.so (version appended)                composing its version, but no longer a
+                                                          live literal there
+                                                    FAIL  libva.so  stale spelling: lib/…/libvartv.so
+                                                          no longer names it as a live literal
+```
+
+Reported from both sides on purpose: the substitution is refused, and the
+declaration is called stale. The real `libva.so` and `libva-drm.so` in the main
+executable are `.rodata` literals, so nothing about the shipped payload changes.
+
+All twenty print the same guidance block before exiting, which names the fix for
+each failure mode:
 
 ```
 One or more assertions failed. Note what this does NOT look like at
