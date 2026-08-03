@@ -76,21 +76,22 @@ runCommand "claude-desktop-dlopen-runpath"
     app = claude-desktop;
     provided = lib.concatStringsSep " " claude-desktop.dlopenSonames;
     dependsOnly = lib.concatStringsSep " " claude-desktop.dlopenSonamesDependsOnly;
-    # "<object> <soname>" per line.
+    # "<object>\t<soname>" per line. Tab-separated, not space: an object path
+    # is a file path and may contain whitespace.
     unprovided = lib.concatStringsSep "\n" (
       lib.concatLists (
         lib.mapAttrsToList (
-          obj: sonames: map (s: "${obj} ${s}") sonames
+          obj: sonames: map (s: "${obj}\t${s}") sonames
         ) claude-desktop.dlopenSonamesUnprovided
       )
     );
-    # "<spelling> <soname it stands for>" per line, in two tables: only the
+    # "<spelling>\t<soname it stands for>" per line, in two tables: only the
     # runtime-versioned one may stand in for an exact reference.
     runtimeVersioned = lib.concatStringsSep "\n" (
-      lib.mapAttrsToList (a: t: "${a} ${t}") claude-desktop.dlopenSonamesRuntimeVersioned
+      lib.mapAttrsToList (a: t: "${a}\t${t}") claude-desktop.dlopenSonamesRuntimeVersioned
     );
     secondSpellings = lib.concatStringsSep "\n" (
-      lib.mapAttrsToList (a: t: "${a} ${t}") claude-desktop.dlopenSonamesSecondSpellings
+      lib.mapAttrsToList (a: t: "${a}\t${t}") claude-desktop.dlopenSonamesSecondSpellings
     );
   }
   ''
@@ -112,13 +113,13 @@ runCommand "claude-desktop-dlopen-runpath"
     # exact string proves nothing about it — if the exact string disappears,
     # that is the news the reference assertion exists to report.
     declare -A ALIAS=() SUBST=()
-    while read -r a t; do
+    while IFS=$'\t' read -r a t; do
       if [ -n "$a" ]; then
         ALIAS["$a"]=$t
         SUBST["$a"]=$t
       fi
     done <<< "$runtimeVersioned"
-    while read -r a t; do
+    while IFS=$'\t' read -r a t; do
       if [ -n "$a" ]; then ALIAS["$a"]=$t; fi
     done <<< "$secondSpellings"
 
@@ -131,15 +132,15 @@ runCommand "claude-desktop-dlopen-runpath"
     # on the strength of one binary.
     declare -A WAIVED=()
     waiverPairs=()
-    while read -r obj s; do
+    while IFS=$'\t' read -r obj s; do
       if [ -n "$obj" ]; then
-        WAIVED["$obj $s"]=1
-        waiverPairs+=("$obj $s")
+        WAIVED["$obj"$'\t'"$s"]=1
+        waiverPairs+=("$obj"$'\t'"$s")
       fi
     done <<< "$unprovided"
 
     isWaivedFor() { # $1 = object, $2 = scanned string
-      if [ -n "''${WAIVED[$1 $(meaningOf "$2")]-}" ]; then return 0; fi
+      if [ -n "''${WAIVED[$1$'\t'$(meaningOf "$2")]-}" ]; then return 0; fi
       return 1
     }
 
@@ -184,7 +185,10 @@ runCommand "claude-desktop-dlopen-runpath"
       SONAME["$rel"]=$(patchelf --print-soname "$f" 2>/dev/null || true)
       while IFS= read -r s; do
         SCANNED["$s"]=1
-        SEENIN["$s"]="''${SEENIN[$s]-}$rel "
+        # Newline-delimited: object paths are file paths and a space-delimited
+        # string would split "resources/My Helper/helper" into two objects
+        # that do not exist, whose empty RUNPATH then fails every lookup.
+        SEENIN["$s"]="''${SEENIN[$s]-}$rel"$'\n' 
       done < <(strings -a "$f" | grep -oE "$sonameRe" | sort -u)
       while IFS= read -r n; do
         NEEDED["$n"]=1
@@ -193,6 +197,15 @@ runCommand "claude-desktop-dlopen-runpath"
     done
 
     echo "scanned ''${#elfs[@]} ELF objects, ''${#SCANNED[@]} distinct soname strings"
+
+    # Does this object name this exact string?
+    namesIt() { # $1 = object, $2 = soname
+      local r
+      while IFS= read -r r; do
+        if [ "$r" = "$1" ]; then return 0; fi
+      done <<< "''${SEENIN[$2]-}"
+      return 1
+    }
 
     # Echoes the RUNPATH directory a soname resolves from, or returns 1.
     # Reads the $ORIGIN-expanded form: an object reaching a bundled library
@@ -266,7 +279,8 @@ runCommand "claude-desktop-dlopen-runpath"
     pairs=0
     skipped=0
     for s in "''${!SCANNED[@]}"; do
-      for rel in ''${SEENIN[$s]-}; do
+      while IFS= read -r rel; do
+        if [ -z "$rel" ]; then continue; fi
         if [ "$s" = "''${SONAME[$rel]-}" ]; then
           skipped=$((skipped + 1))
           continue
@@ -296,12 +310,22 @@ runCommand "claude-desktop-dlopen-runpath"
               "$s" "$rel" "''${SUBST[$s]}"
             rc=1
           fi
-        elif ! resolveIn "$rel" "$s" >/dev/null \
-          && ! resolveIn "$rel" "$(meaningOf "$s")" >/dev/null; then
-          printf '  FAIL    %-26s named by %s, unresolvable from its RUNPATH\n' "$s" "$rel"
-          rc=1
+        elif ! resolveIn "$rel" "$s" >/dev/null; then
+          # The mapped soname is a fallback only when *this* object also names
+          # it — a second spelling is one the binary tries alongside the exact
+          # name, and "somewhere in the payload names the exact name" is not
+          # evidence that this caller does. An object that only ever calls
+          # dlopen("libnotify.so") is broken when just libnotify.so.4 exists,
+          # and must be reported as such.
+          if namesIt "$rel" "$(meaningOf "$s")" \
+            && resolveIn "$rel" "$(meaningOf "$s")" >/dev/null; then
+            :
+          else
+            printf '  FAIL    %-26s named by %s, unresolvable from its RUNPATH\n' "$s" "$rel"
+            rc=1
+          fi
         fi
-      done
+      done <<< "''${SEENIN[$s]-}"
     done
     echo "  ok      $pairs (object, soname) pairs resolve; $skipped exempt (own soname, that object's DT_NEEDED, or waived for that object)"
 
@@ -310,7 +334,7 @@ runCommand "claude-desktop-dlopen-runpath"
     echo "== reference: provided sonames are still named by the payload"
     for s in $provided; do
       if [ -n "''${SCANNED[$s]-}" ]; then
-        printf '  ok      %-26s named by %s\n' "$s" "''${SEENIN[$s]%% *}"
+        printf '  ok      %-26s named by %s\n' "$s" "''${SEENIN[$s]%%$'\n'*}"
         continue
       fi
       # Only a runtime-versioned spelling may stand in for it.
@@ -338,18 +362,16 @@ runCommand "claude-desktop-dlopen-runpath"
     echo "== reference: waivers are still named by the object they were written for"
     namedBy() { # $1 = object, $2 = soname; the exact string, or a spelling
                 # whose version the binary composes at runtime
-      case " ''${SEENIN[$2]-} " in *" $1 "*) return 0 ;; esac
+      if namesIt "$1" "$2"; then return 0; fi
       local a
       for a in "''${!SUBST[@]}"; do
-        if [ "''${SUBST[$a]}" = "$2" ]; then
-          case " ''${SEENIN[$a]-} " in *" $1 "*) return 0 ;; esac
-        fi
+        if [ "''${SUBST[$a]}" = "$2" ] && namesIt "$1" "$a"; then return 0; fi
       done
       return 1
     }
     for pair in "''${waiverPairs[@]}"; do
-      obj=''${pair%% *}
-      s=''${pair#* }
+      obj=''${pair%%$'\t'*}
+      s=''${pair#*$'\t'}
       if namedBy "$obj" "$s"; then
         printf '  ok      %-26s still named by %s\n' "$s" "$obj"
       else
@@ -383,7 +405,7 @@ runCommand "claude-desktop-dlopen-runpath"
       KNOWN["$s"]=1
     done
     for pair in "''${waiverPairs[@]}"; do
-      KNOWN["''${pair#* }"]=1
+      KNOWN["''${pair#*$'\t'}"]=1
     done
 
     unknown=()
@@ -396,7 +418,7 @@ runCommand "claude-desktop-dlopen-runpath"
       echo "  ok      all ''${#SCANNED[@]} classified (DT_NEEDED, bundled, provided, waived, or a declared spelling)"
     else
       for s in $(printf '%s\n' "''${unknown[@]}" | sort); do
-        printf '  FAIL    %-26s unclassified, named by %s\n' "$s" "''${SEENIN[$s]%% *}"
+        printf '  FAIL    %-26s unclassified, named by %s\n' "$s" "''${SEENIN[$s]%%$'\n'*}"
         rc=1
       done
     fi

@@ -208,7 +208,10 @@ exact soname, so they classify the string but never prove the exact one is
 still there. It reads ELF objects only, nothing inside `app.asar`. It resolves
 what the loader is actually asked for — `$ORIGIN` expanded per object, and the
 mapped soname rather than the literal string for a runtime-versioned spelling —
-so a working package is not failed on a technicality.
+so a working package is not failed on a technicality. Where a spelling is one
+the binary carries *beside* the exact soname, the substitution only applies to
+an object that names both: an object whose only call is `dlopen("libnotify.so")`
+is broken when just `libnotify.so.4` exists, and is reported.
 
 ## Updating
 
