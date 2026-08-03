@@ -18,10 +18,12 @@ $ nix run github:<you>/claude-desktop-nix
 | --- | --- |
 | `packages.default` / `packages.claude-desktop` | The app. Use this one. |
 | `packages.claude-desktop-fhs` | Same app inside a `buildFHSEnv` that provides `npx`, `uvx`, `docker`, `git`, `python3` at conventional FHS paths, so published MCP server configs work unmodified. |
+| `packages.claude-desktop-cowork` | Same FHS sandbox, plus QEMU, OVMF and virtiofsd at the paths Cowork's VM probe searches. See [Cowork](#cowork). |
 | `packages.claude-desktop-dev` / `-dev-fhs` | The same build from the **dev** packaging channel — see [Channels](#channels). |
-| `overlays.default` | Adds `claude-desktop`, `claude-desktop-fhs` and their `-dev` counterparts to a nixpkgs instance. |
+| `overlays.default` | Adds `claude-desktop`, `claude-desktop-fhs`, `claude-desktop-cowork` and the `-dev` counterparts to a nixpkgs instance. |
 | `checks.wrapper-flags` | Asserts the wrapper keeps its flags, never gains `--no-sandbox`, ships `chrome-sandbox`, and has a valid desktop entry with rewritten `Exec=` lines. |
 | `checks.dlopen-runpath` | Scans every shipped ELF for soname strings and asserts that each library this package provides resolves from the RUNPATH of every object naming it, that nothing on the lists has stopped being named, and that nothing *new* is named without being classified. See [Dependency provenance](#dependency-provenance). |
+| `checks.cowork-fhs-paths` / `-lean` | Asserts the Cowork sandbox presents every path the app's VM probe searches, that the OVMF code file has its matching vars file, and that the QEMU carried can actually create the devices the helper asks for. Run against both the cached and the trimmed QEMU. |
 
 ### NixOS
 
@@ -348,19 +350,98 @@ tooling.
   pool. Adding it needs a second `sources.json` entry plus an updater that only
   bumps when both arches carry the same version. Deliberately left out of v1;
   see the `TODO(arm64)` markers.
-- **Cowork / KVM / Computer Use.** The `.deb` ships `virtiofsd`,
-  `cowork-linux-helper` and a 27 MB `smol-bin.x64.img`; none of it is wired up.
-  The app reports `computerUse: unsupported_platform` on Linux regardless.
+- **Computer Use.** The app reports `computerUse: unsupported_platform` on Linux
+  regardless of what this package provides. Nothing to wire.
+- **Cowork on `packages.default`.** Not an omission — it is not reachable. Two
+  of the three paths the probe needs are hardcoded absolute FHS locations with
+  no environment override, so only a mount namespace can satisfy them. See
+  [Cowork](#cowork).
 
-  **Cowork cannot start**, and that is by design here: the VM path requires
-  `qemuPath`, `firmwarePath` (OVMF) *and* `virtiofsd`, and neither qemu nor
-  OVMF is anywhere in this package's closure (`nix path-info -r … | grep -c
-  qemu` → `0`). `virtiofsd` is present only so `autoPatchelfHook` resolves its
-  `libseccomp` / `libcap-ng` and the build stays clean. Opening the Cowork tab
-  shows upstream's own message — *"requires QEMU. Install it with
-  `{installCommand}`, then restart Claude"* — where `{installCommand}` is an
-  **`apt` command that is wrong and unactionable on NixOS**. This is cosmetic;
-  nothing is broken by it.
+## Known gaps
+
+Guarantees that are weaker than they look. Each is recorded here rather than
+left implicit, because the failure mode in every case is *silence*: the build
+stays green, the app keeps running, and a feature is quietly dead or quietly
+degraded.
+
+- **`coworkProbe` is hand-transcribed and nothing rescans the payload.**
+  `checks.cowork-fhs-paths` asserts that the FHS tree presents the paths listed
+  in `passthru.coworkProbe` — but that list was read out of `app.asar` by hand,
+  and no check reconciles it against the bundle on a version bump. So the check
+  proves only that *we still create the paths we decided to create*, not that
+  those are still the paths the app looks for. If upstream moves them, every
+  assertion keeps passing and Cowork silently stops working.
+
+  This is the same shape as the `libsecret` gap that motivated
+  `checks.dlopen-runpath`: an invisible downgrade behind a green build. That
+  check solves it by rescanning the shipped ELFs on every run and failing on
+  anything unclassified; this one needs the equivalent — a scan of `app.asar`
+  for the probe's path literals, reconciled against `coworkProbe`, failing when
+  the bundle names something the list does not. Not implemented.
+
+## Cowork
+
+`packages.claude-desktop-cowork` is the FHS variant plus the three host-side
+pieces Cowork's VM path needs. It exists as a separate output because the VM
+toolchain adds ~859 MiB to the FHS closure (~1.56 GiB over `packages.default`),
+and because wanting `npx` to resolve says nothing about wanting a hypervisor.
+
+**Verification status.** `checks.cowork-fhs-paths` proves the sandbox presents
+every path the probe searches and that the QEMU carried can create every device
+the helper asks for. Separately, a QEMU booted inside this exact sandbox
+composition — real KVM vCPUs, a `vhost-vsock-pci` device, a live `virtiofsd`,
+OVMF executing to the point of PXE fallback. What is *not* yet asserted anywhere
+is the end-to-end path through the app itself: gate → helper → bundle download →
+`startVM`. Treat this output as wired and mechanically verified, not as
+end-to-end proven.
+
+Why it cannot be a wrapper on `packages.default`: the app's probe resolves
+`qemuPath` by walking `$PATH`, but resolves `firmwarePath` and `virtiofsdPath`
+by `access(R_OK)` against hardcoded absolute paths —
+`/usr/share/OVMF/OVMF_CODE_4M.fd` (falling back to `OVMF_CODE.fd`) and
+`/usr/libexec/virtiofsd` (falling back to `/usr/bin/virtiofsd`). Neither
+consults an environment variable, `$PATH`, or anything relative to the app
+directory. No wrapper can satisfy them; a mount namespace can.
+
+The bundled `resources/virtiofsd` does not help. The app only consults its own
+copy when `/etc/os-release` reports `ID=ubuntu` and `VERSION_ID` starting `22.`,
+so on NixOS that binary is unreachable and the FHS tree must supply a real one.
+It is still in `buildInputs` for the base package so `autoPatchelfHook` resolves
+its `libseccomp` / `libcap-ng` and the build stays clean.
+
+Host requirements beyond the package: `/dev/kvm` and `/dev/vhost-vsock` must be
+readable and writable. On stock NixOS both are mode `0666` from systemd's own
+udev rules, so no group membership is needed, and `/dev/vhost-vsock` is a static
+node that demand-loads `vhost_vsock` on first open. Loading it explicitly is
+still worth doing:
+
+```nix
+boot.kernelModules = [ "vhost_vsock" ];
+```
+
+because if the demand-load ever fails, the app's fallback probe stats
+`/lib/modules/$(uname -r)` to decide whether the module is merely unloaded or
+the kernel cannot support it — and `/lib/modules` does not exist on NixOS at
+all. The `ENOENT` is read as *"the kernel doesn't include the virtualization
+support Cowork needs, and it can't be added manually"*, which is wrong here and
+sends you debugging the wrong layer.
+
+The first run downloads the guest root filesystem (`rootfs.img`, ~27 MB
+compressed) from `downloads.claude.ai` into
+`$XDG_CONFIG_HOME/Claude/vm_bundles/`. It is not shipped in the `.deb`; the
+bundled `smol-bin.x64.img` is a read-only FAT32 side-disk of guest daemons that
+the VM mounts *after* booting, not the boot image.
+
+`leanQemu` builds a trimmed headless QEMU instead of `qemu_kvm`, dropping the
+display, audio and smartcard front-ends a vsock-driven VM never touches. It
+roughly halves the marginal closure (446 MiB instead of 859 MiB over the FHS
+variant — most of the difference is `clang` and `llvm`, pulled in by
+`pipewire` → `ffmpeg`), at the cost of a source build that no cache carries.
+Off by default:
+
+```nix
+claude-desktop-cowork.override { leanQemu = true; }
+```
 
 ## Licence
 
