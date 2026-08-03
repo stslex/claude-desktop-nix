@@ -336,6 +336,17 @@ runCommand "claude-desktop-dlopen-runpath"
       return 1
     }
 
+    # Does any shipped object carry this soname as a live literal? The
+    # payload-wide form of triesItself, for the assertions whose question is
+    # payload-wide ("is this still probed anywhere") rather than per object.
+    someObjectTries() { # $1 = soname
+      local r
+      while IFS= read -r r; do
+        if [ -n "$r" ] && triesItself "$r" "$1"; then return 0; fi
+      done <<< "''${SEENIN[$1]-}"
+      return 1
+    }
+
     # Echoes the RUNPATH directory a soname resolves from, or returns 1.
     # Reads the $ORIGIN-expanded form: an object reaching a bundled library
     # through an origin-relative entry resolves at runtime and must not be
@@ -493,19 +504,24 @@ runCommand "claude-desktop-dlopen-runpath"
     echo
     echo "== reference: provided sonames are still named by the payload"
     for s in $provided; do
-      if [ -n "''${SCANNED[$s]-}" ]; then
+      # A live literal somewhere, not merely a string somewhere: a soname left
+      # behind in DT_NEEDED, in debug metadata or in a section that is never
+      # mapped is not a probe, and an entry kept alive by one is an assertion
+      # that passes forever while testing nothing.
+      if someObjectTries "$s"; then
         printf '  ok      %-26s named by %s\n' "$s" "''${SEENIN[$s]%%$'\n'*}"
         continue
       fi
-      # Only a runtime-versioned spelling may stand in for it.
+      # Only a runtime-versioned spelling may stand in for it, on the same
+      # evidence.
       via=""
       for a in "''${!SUBST[@]}"; do
-        if [ "''${SUBST[$a]}" = "$s" ] && [ -n "''${SCANNED[$a]-}" ]; then via=$a; break; fi
+        if [ "''${SUBST[$a]}" = "$s" ] && someObjectTries "$a"; then via=$a; break; fi
       done
       if [ -n "$via" ]; then
         printf '  ok      %-26s named as %s (version appended at runtime)\n' "$s" "$via"
       else
-        printf '  FAIL    %-26s no longer named by any shipped ELF\n' "$s"
+        printf '  FAIL    %-26s no longer a live literal in any shipped ELF\n' "$s"
         rc=1
       fi
     done
@@ -560,10 +576,10 @@ runCommand "claude-desktop-dlopen-runpath"
     done
     for a in $(printf '%s\n' "''${!ALIAS[@]}" | sort); do
       if [ -n "''${SUBST[$a]-}" ]; then continue; fi
-      if [ -n "''${SCANNED[$a]-}" ]; then
+      if someObjectTries "$a"; then
         printf '  ok      %-26s stands for %s (second spelling)\n' "$a" "''${ALIAS[$a]}"
       else
-        printf '  FAIL    %-26s stale spelling: no longer named by any shipped ELF\n' "$a"
+        printf '  FAIL    %-26s stale spelling: no longer a live literal in any shipped ELF\n' "$a"
         rc=1
       fi
     done
@@ -610,7 +626,9 @@ runCommand "claude-desktop-dlopen-runpath"
                        object failing usually means the library is gone rather
                        than misplaced.
 
-      no longer named  upstream stopped using it. Drop it from dlopenSonames
+      no longer a live upstream stopped probing for it — any occurrence left is
+      literal          linkage metadata or debug information, not a call site.
+                       Drop it from dlopenSonames
                        (and from runtimeLibs if nothing else needs it), or move
                        it to dlopenSonamesDependsOnly if the .deb still lists
                        it in Depends.

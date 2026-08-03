@@ -26,7 +26,7 @@ under measurement, and now carries the evidence it should have had:
   which is exactly what makes them easy to confuse. The claim stands; the proof
   is now in D1.
 
-Twelve further review rounds on the rewrite found seventeen more holes in the
+Thirteen further review rounds on the rewrite found eighteen more holes in the
 guard, all now closed and described in D3. Round two: `DT_NEEDED` was classified
 globally rather than per object, so one object could dlopen a soname only
 another object links with nothing checking it could reach it; and a waiver
@@ -71,9 +71,11 @@ its behalf. Round twelve found the one path that never reached the
 mapped-literal gate — a spelling could inherit its target's waiver with no
 evidence that the object treats them as the same library, so a probe for the
 generic name was excused by a waiver on a name the object merely links. Round
-thirteen applied the same rule to the last place it was missing: a
-runtime-versioned declaration was honoured, and kept alive, on any occurrence of
-the prefix at all, including one surviving only in debug metadata.
+thirteen applied the same rule to a runtime-versioned declaration, which was
+honoured and kept alive on any occurrence of the prefix at all, including one
+surviving only in debug metadata; round fourteen applied it to the plainest
+path of the lot, the provided sonames themselves, whose reference assertion was
+still satisfied by a bare scan hit.
 
 The D3 gap is separately closed: the workflow has since run in CI on a real
 bump. All of this is detailed in the sections below.
@@ -880,8 +882,33 @@ Reported from both sides on purpose: the substitution is refused, and the
 declaration is called stale. The real `libva.so` and `libva-drm.so` in the main
 executable are `.rodata` literals, so nothing about the shipped payload changes.
 
-All twenty print the same guidance block before exiting, which names the fix for
-each failure mode:
+**AND THE PLAINEST PATH OF ALL.** The provided sonames — the original list, the
+thing the guard was built around — still had their reference assertion satisfied
+by any occurrence of the string. A probe removed upstream while the name stayed
+in `DT_NEEDED` or in debug metadata would leave the entry looking current, with
+`runtimeLibs` keeping it resolvable, so every assertion stayed green over a dead
+declaration. An object whose only `libkrb5.so.3` is in a `noload` section, with
+krb5 on its RUNPATH and the soname added to `dlopenSonames`:
+
+```
+round-13 check                                round-14 check
+  ok  libkrb5.so.3  -> …-krb5-1.22.2-lib/lib    ok    libkrb5.so.3  -> …-krb5-1.22.2-lib/lib
+  ok  libkrb5.so.3  named by lib/…/libprov.so   FAIL  libkrb5.so.3  no longer a live literal
+                                                      in any shipped ELF
+```
+
+The resolve assertion passes in both — the library really is in the closure.
+Only the reference assertion tells the truth about whether anything still asks
+for it.
+
+With this the same evidence rule covers every assertion and every table:
+provided sonames, waivers, both spelling tables, in both the per-object and the
+payload-wide direction. All twenty-two provided entries and all six second
+spellings pass it unchanged, which is the point — they are genuine `.rodata`
+probe literals, and the rule exists to require that they stay so.
+
+All twenty-one print the same guidance block before exiting, which names the fix
+for each failure mode:
 
 ```
 One or more assertions failed. Note what this does NOT look like at
