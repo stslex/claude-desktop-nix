@@ -153,7 +153,7 @@ runCommand "claude-desktop-dlopen-runpath"
     # into the second would let object A dlopen a soname that only object B
     # links, with nothing checking that A can actually reach it.
     declare -A RPATH=() RPATHX=() SCANNED=() SEENIN=() NEEDED=() NEEDED_BY=() SONAME=() BUNDLED=()
-    declare -A LITERAL=()
+    declare -A LITERAL=() UNREADABLE=() UNREADABLE_REPORTED=()
     elfs=()
 
     # -type f here (unlike the bundled inventory below): each real object is
@@ -177,7 +177,16 @@ runCommand "claude-desktop-dlopen-runpath"
 
     for f in "''${elfs[@]}"; do
       rel=''${f#$app/}
-      RPATH["$rel"]=$(patchelf --print-rpath "$f" 2>/dev/null || true)
+      # patchelf reads the dynamic metadata through the section headers, so an
+      # object it cannot parse — a section-header-less or self-decompressing
+      # ELF — yields no RUNPATH and no DT_NEEDED. Left implicit that reads as
+      # "every soname it names is unresolvable", which is the right verdict
+      # reached by the wrong route and reported unintelligibly. Record it and
+      # say so once instead.
+      if ! RPATH["$rel"]=$(patchelf --print-rpath "$f" 2>/dev/null); then
+        UNREADABLE["$rel"]=1
+        RPATH["$rel"]=""
+      fi
       # $ORIGIN is the directory of the object being loaded, so it has to be
       # expanded per object, exactly as the loader does. [$] keeps the token
       # out of this file as a literal that Nix would try to interpolate.
@@ -206,25 +215,50 @@ runCommand "claude-desktop-dlopen-runpath"
       # Deciding this by offset rather than by subtracting DT_NEEDED names
       # keeps the object that both links a soname and carries it as a literal
       # fallback: that one really does try both spellings.
+      loadRanges=""
+      while read -r segOff segVaddr segSize; do
+        if [ -n "$segOff" ]; then
+          loadRanges="$loadRanges $((segOff)):$((segOff + segSize))"
+        fi
+      done < <(readelf -lW "$f" 2>/dev/null | awk '$1 == "LOAD" { print $2, $3, $5 }' || true)
+
+      # The dynamic string table, located through PT_DYNAMIC rather than the
+      # section headers. Section headers are optional in ELF — a stripped
+      # section-header table would leave this unfound, and "unfound" used to
+      # mean "no linkage table to exclude", i.e. every DT_NEEDED name counted
+      # as a literal. DT_STRTAB/DT_STRSZ are what the loader itself reads, so
+      # they are there whenever there is anything to exclude.
       dynOff=-1
       dynEnd=-1
-      dynRange=$(readelf -SW "$f" 2>/dev/null \
-        | sed -E 's/^ *\[[ 0-9]+\] *//' \
-        | awk '$1 == ".dynstr" { print $4, $5; exit }' || true)
-      if [ -n "$dynRange" ]; then
-        read -r dynHexOff dynHexSize <<< "$dynRange"
-        dynOff=$((16#$dynHexOff))
-        dynEnd=$((dynOff + 16#$dynHexSize))
-      fi
-
-      loadRanges=""
-      while read -r segOff segSize; do
-        if [ -n "$segOff" ]; then
-          loadRanges="$loadRanges $((segOff)):$(($segOff + $segSize))"
-        fi
-      done < <(readelf -lW "$f" 2>/dev/null | awk '$1 == "LOAD" { print $2, $5 }' || true)
+      dynUnknown=0
+      dynInfo=$(readelf -dW "$f" 2>/dev/null || true)
+      case "$dynInfo" in
+        *"(STRTAB)"*)
+          strtabVaddr=$(printf '%s\n' "$dynInfo" | awk '/\(STRTAB\)/ { print $3; exit }')
+          strtabSize=$(printf '%s\n' "$dynInfo" | awk '/\(STRSZ\)/ { print $3; exit }')
+          if [ -n "$strtabVaddr" ] && [ -n "$strtabSize" ]; then
+            while read -r segOff segVaddr segSize; do
+              if [ -n "$segOff" ] \
+                && [ $((strtabVaddr)) -ge $((segVaddr)) ] \
+                && [ $((strtabVaddr)) -lt $((segVaddr + segSize)) ]; then
+                dynOff=$((strtabVaddr - segVaddr + segOff))
+                dynEnd=$((dynOff + strtabSize))
+                break
+              fi
+            done < <(readelf -lW "$f" 2>/dev/null | awk '$1 == "LOAD" { print $2, $3, $5 }' || true)
+          fi
+          # A dynamic object whose string table could not be placed: refuse to
+          # guess. No literal evidence is recorded for it, so the fallback that
+          # evidence would unlock simply does not apply — closed, not open.
+          if [ "$dynOff" -lt 0 ]; then
+            dynUnknown=1
+            echo "note: cannot locate the dynamic string table of $rel; no literal evidence will be credited to it"
+          fi
+          ;;
+      esac
 
       while IFS= read -r s; do
+        if [ "$dynUnknown" -eq 1 ]; then break; fi
         LITERAL["$rel"]="''${LITERAL[$rel]-}$s"$'\n' 
       done < <(
         strings -a -t d "$f" \
@@ -354,6 +388,27 @@ runCommand "claude-desktop-dlopen-runpath"
     for s in "''${!SCANNED[@]}"; do
       while IFS= read -r rel; do
         if [ -z "$rel" ]; then continue; fi
+        # An object patchelf cannot parse has no readable RUNPATH, DT_NEEDED or
+        # DT_SONAME, so nothing it names can be shown to resolve and the two
+        # exemptions that come from that metadata cannot be applied either.
+        # Fail closed, and say which of the two problems this is — but only for
+        # sonames it actually names, since an object that names none (the
+        # self-decompressing cowork helper, today) needs none of it.
+        if [ -n "''${UNREADABLE[$rel]-}" ]; then
+          if isWaivedFor "$rel" "$s"; then
+            skipped=$((skipped + 1))
+            continue
+          fi
+          pairs=$((pairs + 1))
+          printf '  FAIL    %-26s named by %s, whose dynamic metadata patchelf cannot read\n' "$s" "$rel"
+          if [ -z "''${UNREADABLE_REPORTED[$rel]-}" ]; then
+            UNREADABLE_REPORTED["$rel"]=1
+            echo "          (a stripped section-header table or a self-decompressing binary:"
+            echo "           its RUNPATH is unknown, so this cannot be shown to resolve)"
+          fi
+          rc=1
+          continue
+        fi
         if [ "$s" = "''${SONAME[$rel]-}" ]; then
           skipped=$((skipped + 1))
           continue

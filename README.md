@@ -213,7 +213,9 @@ the binary carries *beside* the exact soname, the substitution only applies to
 an object that looks like it tries both — decided by byte offset: the name has
 to occur inside a `PT_LOAD` segment (so a call site can reach it at runtime;
 `dontStrip = true` keeps unmapped metadata sections in the file) and outside
-`.dynstr` (which is where the linker records `DT_NEEDED` and `DT_SONAME`). An object whose only call
+the dynamic string table (which is where the linker records `DT_NEEDED` and
+`DT_SONAME`), located through `PT_DYNAMIC` rather than by section-header name,
+since section headers are optional. An object whose only call
 is `dlopen("libnotify.so")` is broken when just `libnotify.so.4` exists,
 however it is linked, and is reported.
 

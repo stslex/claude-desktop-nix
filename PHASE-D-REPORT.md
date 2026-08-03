@@ -26,7 +26,7 @@ under measurement, and now carries the evidence it should have had:
   which is exactly what makes them easy to confuse. The claim stands; the proof
   is now in D1.
 
-Eight further review rounds on the rewrite found thirteen more holes in the
+Nine further review rounds on the rewrite found fourteen more holes in the
 guard, all now closed and described in D3. Round two: `DT_NEEDED` was classified
 globally rather than per object, so one object could dlopen a soname only
 another object links with nothing checking it could reach it; and a waiver
@@ -60,7 +60,11 @@ carry it as a literal fallback. Round nine finished the thought — "outside
 keeps `.comment`, `.shstrtab` and `.gnu_debuglink` in the file, and a soname
 sitting in one of those is a note about the binary rather than something it can
 open. The evidence is now an occurrence inside a `PT_LOAD` segment and outside
-`.dynstr`.
+`.dynstr`. Round ten removed the last fail-open default in that machinery:
+`.dynstr` was located by section-header *name*, and ELF section headers are
+optional, so an object that hid them fell through to "no linkage table to
+exclude". It is derived from `PT_DYNAMIC`'s `DT_STRTAB`/`DT_STRSZ` now — what
+the loader itself reads.
 
 The D3 gap is separately closed: the workflow has since run in CI on a real
 bump. All of this is detailed in the sections below.
@@ -294,7 +298,7 @@ fresh scan of every ELF object in the output:
 | | Assertion | The regression it catches |
 | --- | --- | --- |
 | 1 | **RESOLVE** — every soname the package claims to provide resolves from the main executable's RUNPATH | the library leaves the closure, or the RUNPATH stops reaching it |
-| 1b | **REACHABILITY** — *every* (object, soname) pair the scan produced resolves from that object's own RUNPATH — resolving what the loader is actually asked for, which for a runtime-versioned spelling is the mapped soname rather than the string in the binary, and for a second spelling is the literal unless *this same object* carries the exact soname where a call could reach it — inside a `PT_LOAD` segment and outside `.dynstr`, rather than in linkage metadata or in a section that is never mapped — exempting only the object's own `DT_SONAME`, its **own** `DT_NEEDED`, and sonames waived **for that object** | object A dlopening something only object B links, or something waived only because B probes for it. Both `DT_NEEDED` and a waiver are per-object facts; a global union of either vouches for A on B's evidence |
+| 1b | **REACHABILITY** — *every* (object, soname) pair the scan produced resolves from that object's own RUNPATH — resolving what the loader is actually asked for, which for a runtime-versioned spelling is the mapped soname rather than the string in the binary, and for a second spelling is the literal unless *this same object* carries the exact soname where a call could reach it — inside a `PT_LOAD` segment and outside the dynamic string table located through `PT_DYNAMIC`, rather than in linkage metadata or in a section that is never mapped — exempting only the object's own `DT_SONAME`, its **own** `DT_NEEDED`, and sonames waived **for that object** | object A dlopening something only object B links, or something waived only because B probes for it. Both `DT_NEEDED` and a waiver are per-object facts; a global union of either vouches for A on B's evidence |
 | 2 | **REFERENCE** — every soname the lists mention is still named by the payload: provided sonames anywhere, waivers by the object they were written for, declared aliases anywhere | upstream drops a dlopen and the entry becomes an assertion that passes forever while testing nothing; or a waiver or alias goes stale and silently pre-approves a soname that later comes back for something that matters |
 | 3 | **NOVELTY** — every soname-shaped string in the payload is accounted for: `DT_NEEDED`, bundled with the app, provided by us, or waived by name with a reason | upstream *adds* a dlopen — which the others cannot see at all |
 
@@ -762,7 +766,48 @@ round-6 check                          round-7 check
 `dlopen` matches on the name it is asked for, so that call returns NULL however
 the object is linked.
 
-All sixteen print the same guidance block before exiting, which names the fix
+**A FAIL-OPEN DEFAULT, AND WHAT LOOKING FOR IT TURNED UP.** `.dynstr` was found
+by section-header name, and section headers are optional in ELF: an object
+without them fell through to `dynOff=-1`, meaning "no linkage table to exclude",
+so every `DT_NEEDED` name in the mapped string table counted as a literal. It is
+derived from `PT_DYNAMIC`'s `DT_STRTAB` and `DT_STRSZ` now, which is what the
+loader itself reads. Verified against the section headers on three real
+objects, byte for byte:
+
+```
+  claude-desktop           PT_DYNAMIC -> [218107904 218954328]   sections -> [218107904 218954328]
+  libGLESv2.so             PT_DYNAMIC -> [6427200 6470926]       sections -> [6427200 6470926]
+  chrome_crashpad_handler  PT_DYNAMIC -> [1921568 1931616]       sections -> [1921568 1931616]
+```
+
+**No before/after transcript for this one, and the reason is worth recording.**
+Two fixtures were built to exercise the old path — an object with
+`--strip-section-headers`, and one with `.dynstr` renamed — and neither showed a
+difference, because `patchelf` refuses both files as well. Its `--print-rpath`
+and `--print-needed` exit 1, the object ends up with an empty RUNPATH record,
+and everything it names fails in *both* revisions. The hole was real in the code
+and unreachable in practice, masked by an accident of a different tool. Deriving
+the range from `PT_DYNAMIC` is still the right fix — the guard should not depend
+on that accident, and a later change of how the RUNPATH is read would silently
+reopen it — but nothing about the current payload changes.
+
+What the fixtures did expose is a reporting bug. An object patchelf cannot parse
+used to produce a stream of "unresolvable from its RUNPATH" lines, which is the
+right verdict reached by the wrong route and explained misleadingly. It now says
+so:
+
+```
+  FAIL    libnotify.so.4   named by lib/…/libnosh.so, whose dynamic metadata patchelf cannot read
+          (a stripped section-header table or a self-decompressing binary:
+           its RUNPATH is unknown, so this cannot be shown to resolve)
+```
+
+The diagnosis is attached to the sonames such an object actually names, not to
+the object itself — `resources/cowork-linux-helper` is exactly that kind of
+binary today, and it names no sonames at all, so nothing about it needs
+reporting.
+
+All seventeen print the same guidance block before exiting, which names the fix
 for each failure mode:
 
 ```
