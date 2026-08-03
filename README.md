@@ -210,8 +210,11 @@ what the loader is actually asked for — `$ORIGIN` expanded per object, and the
 mapped soname rather than the literal string for a runtime-versioned spelling —
 so a working package is not failed on a technicality. Where a spelling is one
 the binary carries *beside* the exact soname, the substitution only applies to
-an object that names both: an object whose only call is `dlopen("libnotify.so")`
-is broken when just `libnotify.so.4` exists, and is reported.
+an object that looks like it tries both — and a soname present only as that
+object's `DT_NEEDED` or `DT_SONAME` does not count, since linkage metadata
+lands in `.dynstr` and therefore in any string scan. An object whose only call
+is `dlopen("libnotify.so")` is broken when just `libnotify.so.4` exists,
+however it is linked, and is reported.
 
 ## Updating
 

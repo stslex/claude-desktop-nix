@@ -207,6 +207,23 @@ runCommand "claude-desktop-dlopen-runpath"
       return 1
     }
 
+    # Does this object look like it tries this exact spelling *itself*?
+    #
+    # Stricter than namesIt, and the difference matters: an object's DT_NEEDED
+    # entries and its own DT_SONAME live in .dynstr, which is part of the file
+    # and therefore part of the string scan. A soname present only for that
+    # reason is linkage metadata, not a second dlopen attempt — and dlopen
+    # matches on the name asked for, so a call to the generic spelling still
+    # returns NULL when only the versioned file is on the RUNPATH, however
+    # the object is linked.
+    triesItself() { # $1 = object, $2 = exact soname
+      case " ''${NEEDED_BY[$1]-} " in
+        *" $2 "*) return 1 ;;
+      esac
+      if [ "$2" = "''${SONAME[$1]-}" ]; then return 1; fi
+      namesIt "$1" "$2"
+    }
+
     # Echoes the RUNPATH directory a soname resolves from, or returns 1.
     # Reads the $ORIGIN-expanded form: an object reaching a bundled library
     # through an origin-relative entry resolves at runtime and must not be
@@ -311,13 +328,14 @@ runCommand "claude-desktop-dlopen-runpath"
             rc=1
           fi
         elif ! resolveIn "$rel" "$s" >/dev/null; then
-          # The mapped soname is a fallback only when *this* object also names
-          # it — a second spelling is one the binary tries alongside the exact
-          # name, and "somewhere in the payload names the exact name" is not
-          # evidence that this caller does. An object that only ever calls
+          # The mapped soname is a fallback only when *this* object looks like
+          # it tries that spelling too — a second spelling is one the binary
+          # attempts alongside the exact name, and neither "somewhere in the
+          # payload names it" nor "this object links it" is evidence that this
+          # caller attempts it. An object whose only call is
           # dlopen("libnotify.so") is broken when just libnotify.so.4 exists,
-          # and must be reported as such.
-          if namesIt "$rel" "$(meaningOf "$s")" \
+          # however it is linked, and must be reported as such.
+          if triesItself "$rel" "$(meaningOf "$s")" \
             && resolveIn "$rel" "$(meaningOf "$s")" >/dev/null; then
             :
           else
