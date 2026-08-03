@@ -512,31 +512,34 @@ passes with both checks built.
 The original gap was that the workflow had never executed: the repo had no git
 remote, so "a bump fails loudly" rested entirely on a local exit code plus
 Actions' documented gating semantics. **That is closed.** The repo has a remote,
-and the updater has run end to end on a real bump — run `30801047214`,
-2026-08-03, a `workflow_dispatch` from
-`claude/ci-maintenance-update-workflow` with `sources.json` pinned one release
-back specifically to exercise the bump path:
+and the updater has now run end to end on a real bump twice — run
+`30801047214` against the pre-review guard, and run `30804260785` against the
+rewritten one. Both were `workflow_dispatch` runs from a branch with
+`sources.json` pinned one release back, which is the only way to exercise the
+bump path on demand (without a pin there is nothing to bump and every gated
+step skips). The second one:
 
 ```
-Bump sources.json      hash verified:  sha256-MC5tII3YyOnlIGfaoo7zsRcaFhNYb9DhC+3GQiJbbuE=
-                       version=1.24012.9
+Bump sources.json      version=1.24012.9
                        changed=true
 Build the new version  success
 Guard - dlopen'd libraries still resolve from RUNPATH
-                       building '/nix/store/dsrhgv38wvfkfckcv7g5c9cvsyqf1wqd-claude-desktop-dlopen-runpath.drv'...
-                       claude-desktop-dlopen-runpath> RUNPATH has 38 entries
+                       claude-desktop-dlopen-runpath> scanned 14 ELF objects, 93 distinct soname strings
+                       claude-desktop-dlopen-runpath> == resolve: provided sonames, from the main executable's RUNPATH
                        claude-desktop-dlopen-runpath>   ok  libsecret-1.so.0  -> …-libsecret-0.21.7/lib
-                       (22 ok lines, step green)
+                       claude-desktop-dlopen-runpath>   ok  libgdk-3.so.0     -> …-gtk+3-3.24.52/lib
+                       claude-desktop-dlopen-runpath>   ok  libnssckbi.so     -> …-nss-3.112.5/lib
+                       (all three assertion blocks green)
 Run flake checks       success
 Open pull request      pull-request-operation = none
 ```
 
 So the gated steps do run in order on a real bump, and the guard executes
-against a freshly built package in CI rather than only on this laptop. Two
-honest footnotes on that run: the guard it exercised was the pre-review
-version (the rewrite in this PR has been run locally, not yet in CI), and
-`pull-request-operation = none` because the branch bumped to the version `dev`
-already carried, so there was nothing to open a PR about.
+against a freshly built package in CI rather than only on this laptop — the
+scan included, on a runner that had never seen this store path. One footnote:
+`pull-request-operation = none` in both runs because the pinned branch bumped
+back to the version `dev` already carried, so there was nothing to open a PR
+about. The pin branch was deleted after the run.
 
 **What remains an inference:** no CI run has yet had the guard *fail*, so "a
 failing guard blocks PR creation" is still read off `if:` semantics rather than
@@ -723,10 +726,11 @@ got a response.
    version parity.
 9. ~~**`PHASE-D-REPORT.md` is untracked**~~ **Closed** by `bc1b793`, which
    committed this file (sanitized) as part of PR #1.
-10. **The rewritten D3 guard has not itself run in CI yet.** The run that
-    closed gap 1 exercised the pre-review version. The rewrite passes locally,
-    fails locally in all three directions, and will first run in CI on the next
-    scheduled bump.
+10. ~~**The rewritten D3 guard has not itself run in CI yet.**~~ **Closed** by
+    run `30804260785`: the three-assertion version ran on a real bump on a
+    clean runner and passed. What has still never been observed in CI is the
+    guard *failing* — see the D3 gap section for which parts of that are
+    measured and which are inferred.
 
 Phase C is **closed, not a gap**: you selected option 2 (one `/goal` per
 phase), so the proposed goal-text change was never needed and no hook config
