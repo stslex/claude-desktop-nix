@@ -37,6 +37,13 @@ export XDG_CACHE_HOME="$ROOT/cache"
 export XDG_DATA_HOME="$ROOT/data"
 export XDG_STATE_HOME="$ROOT/state"
 
+# The sign-in callback is a claude:// deep link. The app registers
+# x-scheme-handler/claude=com.anthropic.Claude.desktop in the throwaway
+# mimeapps.list, but that desktop entry lives in the package's own share/ —
+# we run the binary straight out of the store, so nothing would resolve the
+# name and the redirect back from the browser silently does nothing.
+export XDG_DATA_DIRS="$PKG/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+
 echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
 echo "app log will also be at: $ROOT/config/Claude/logs/"
 echo

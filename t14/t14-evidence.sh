@@ -24,12 +24,20 @@ echo
 # this host; matching on the binary name alone would report it as a success.
 # The vhost-vsock device is the discriminator: the Android emulator never uses
 # one, and the Cowork helper always does.
+# Scan /proc rather than `pgrep -x qemu-system-x86_64`: nixpkgs' qemu is a
+# wrapper, so the real process is .qemu-system-x86_64-wrapped and its comm is
+# truncated to ".qemu-system-x8". `pgrep -x` matches comm, never matched ours,
+# and the collector reported NO VM while a VM was demonstrably running — the
+# exact false negative this script exists to rule out. argv[0] is still
+# "qemu-system-x86_64", so match on the cmdline instead.
 find_qemu() {
-  local pid
-  for pid in $(pgrep -x qemu-system-x86_64 2>/dev/null); do
-    if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'vhost-vsock-pci'; then
-      echo "$pid"; return 0
-    fi
+  local d pid c
+  for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    c=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
+    case "$c" in
+      *qemu-system-x86_64*vhost-vsock-pci*) echo "$pid"; return 0 ;;
+    esac
   done
   return 1
 }
