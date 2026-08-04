@@ -19,6 +19,14 @@
   gzip,
   which,
 
+  # URL-scheme dispatch. Not part of the MCP toolchain — this is what makes
+  # `claude://` links work at all. Electron hands external URLs to `xdg-open`,
+  # and inside a mount namespace only what this list provides exists: without
+  # it there is no dispatcher in the sandbox, so the sign-in callback and the
+  # desktop entry's own `claude://claude.ai/new` actions resolve to nothing and
+  # fail silently. Confirmed by a live run before this was added.
+  xdg-utils,
+
   # --- Cowork VM toolchain (only referenced when `cowork` is true) -----------
   qemu,
   qemu_kvm,
@@ -31,7 +39,7 @@
 
   # Build the Cowork-enabled variant: same application, same sandbox, plus the
   # three host-side pieces the VM path needs at the paths it looks for them.
-  # Off by default; `claude-desktop-fhs` is byte-for-byte what it always was.
+  # Off by default, so `claude-desktop-fhs` carries none of the VM toolchain.
   #
   # This lives here rather than in a file of its own because the FHS sandbox is
   # not incidental to Cowork — it is the whole mechanism. Two of the three
@@ -168,6 +176,7 @@ buildFHSEnv {
       gnutar
       gzip
       which
+      xdg-utils
     ]
     ++ lib.optionals cowork coworkTargetPkgs;
 

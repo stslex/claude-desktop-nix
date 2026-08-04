@@ -63,6 +63,16 @@
         claude-desktop-cowork = final.callPackage ./pkgs/claude-desktop-fhs.nix {
           cowork = true;
           ovmf-fhs = final.callPackage ./pkgs/ovmf-fhs.nix { };
+
+          # The trimmed QEMU is the default here, not an opt-in. It halves the
+          # marginal closure, and everything the helper's argv names survives
+          # the trim — asserted by checks.cowork-fhs-paths against this build,
+          # and exercised end to end by a booted guest (see t14/). The cost is
+          # a source build no cache carries; the untrimmed one is one override
+          # away:
+          #
+          #     claude-desktop-cowork.override { leanQemu = false; }
+          leanQemu = true;
         };
       };
 
@@ -139,17 +149,18 @@
             inherit claude-desktop;
           };
 
-          # Both Cowork variants, because the `leanQemu` build is the one
-          # with a real reason to fail these assertions and the cached
-          # `qemu_kvm` build is the one that never will. Checking only the
-          # default would leave the trimmed QEMU — a public option with a
-          # documented risk — with no coverage of that risk at all.
+          # Both Cowork variants. The default is now the trimmed QEMU — the
+          # build with a real reason to fail these assertions — so the base
+          # check covers the risk rather than the safe case. The second leg
+          # overrides back to the cached `qemu_kvm`: it is the supported
+          # escape hatch, and an escape hatch nothing evaluates is one that
+          # breaks unnoticed and is discovered by whoever reaches for it.
           cowork-fhs-paths = pkgs.callPackage ./pkgs/cowork-fhs-paths.nix {
             claude-desktop-cowork = self.packages.${system}.claude-desktop-cowork;
           };
-          cowork-fhs-paths-lean = pkgs.callPackage ./pkgs/cowork-fhs-paths.nix {
+          cowork-fhs-paths-full-qemu = pkgs.callPackage ./pkgs/cowork-fhs-paths.nix {
             claude-desktop-cowork = self.packages.${system}.claude-desktop-cowork.override {
-              leanQemu = true;
+              leanQemu = false;
             };
           };
         }

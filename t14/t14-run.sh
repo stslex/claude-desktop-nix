@@ -14,15 +14,30 @@ REPO=${COWORK_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 # NOT covered by the XDG redirection below. A second instance would connect to
 # whichever cowork-linux-helper already owns that path — a different binary from
 # a different build — and the test would be measuring the wrong thing.
-if pgrep -f 'lib/claude-desktop/claude-desktop' >/dev/null 2>&1; then
+# Matched by /proc/PID/exe, not by cmdline. This checkout is named
+# claude-desktop-nix, so a cmdline pattern matches any process that merely
+# mentions the directory — an editor, a grep, the shell running this — and the
+# guard would refuse to start against a phantom.
+running() {
+  local pat=$1 d e hit=1
+  for d in /proc/[0-9]*; do
+    e=$(readlink "$d/exe" 2>/dev/null) || continue
+    case "$e" in
+      *"$pat"*) echo "  pid ${d#/proc/}: $e" >&2; hit=0 ;;
+    esac
+  done
+  return $hit
+}
+
+if running 'lib/claude-desktop/claude-desktop' 2>/dev/null >/dev/null; then
   echo "refusing to start: a Claude Desktop is already running." >&2
   echo "quit it (tray -> Quit), then re-run. Offending processes:" >&2
-  pgrep -af 'lib/claude-desktop/claude-desktop' | head -3 >&2
+  running 'lib/claude-desktop/claude-desktop' >/dev/null
   exit 1
 fi
-if pgrep -f 'cowork-linux-helper' >/dev/null 2>&1; then
+if running 'cowork-linux-helper' 2>/dev/null >/dev/null; then
   echo "refusing to start: a cowork-linux-helper is still holding the socket." >&2
-  pgrep -af 'cowork-linux-helper' >&2
+  running 'cowork-linux-helper' >/dev/null
   echo "it is orphaned; kill it with: pkill -f cowork-linux-helper" >&2
   exit 1
 fi

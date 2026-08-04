@@ -2,9 +2,10 @@
   lib,
   runCommand,
 
-  # The variant under test. Parameterised rather than hardcoded because the
-  # `leanQemu` build is the one with a real reason to fail these assertions, and
-  # a guard that only ever runs against the build that cannot fail is decoration.
+  # The variant under test. Parameterised rather than hardcoded so both QEMUs
+  # are covered: the trimmed default, which is the one with a real reason to
+  # fail these assertions, and the `leanQemu = false` escape hatch, which is
+  # supported and therefore has to keep evaluating.
   claude-desktop-cowork,
 }:
 
@@ -33,7 +34,9 @@ let
   inherit (claude-desktop-cowork) coworkProbe coworkQemuNeeds;
 in
 runCommand
-  "${claude-desktop-cowork.pname}-fhs-paths${lib.optionalString claude-desktop-cowork.leanQemu "-lean"}"
+  "${claude-desktop-cowork.pname}-fhs-paths-${
+    if claude-desktop-cowork.leanQemu then "lean" else "full"
+  }-qemu"
   { }
   ''
     set -uo pipefail

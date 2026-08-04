@@ -34,12 +34,32 @@ find_qemu() {
   local d pid c
   for d in /proc/[0-9]*; do
     pid=${d#/proc/}
-    c=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
+    # 2>/dev/null must precede the input redirection: redirections are applied
+    # left to right, and a process that exits between the glob and the read
+    # would otherwise print "No such file or directory" into the report.
+    c=$(tr '\0' ' ' 2>/dev/null < "$d/cmdline") || continue
     case "$c" in
       *qemu-system-x86_64*vhost-vsock-pci*) echo "$pid"; return 0 ;;
     esac
   done
   return 1
+}
+
+# Same reasoning as find_qemu, for processes that need no discriminator beyond
+# their identity. Matching /proc/PID/exe rather than comm or the cmdline is
+# immune to all three traps this script has hit: comm's 15-character
+# truncation, nixpkgs' `.foo-wrapped` indirection (the wrapper's exe still
+# contains the name), and a pattern that matches the shell running the scan,
+# whose exe is bash.
+find_by_exe() {
+  local pat=$1 d e hit=1
+  for d in /proc/[0-9]*; do
+    e=$(readlink "$d/exe" 2>/dev/null) || continue
+    case "$e" in
+      *"$pat"*) echo "${d#/proc/}"; hit=0 ;;
+    esac
+  done
+  return $hit
 }
 
 start=$(date +%s); qemu=""
@@ -69,11 +89,14 @@ if [ -n "$qemu" ]; then
   echo "   /dev/vhost-vsock open means the host<->guest RPC transport exists)"
   echo
   echo "--- 3. virtiofsd ---"
-  for p in $(pgrep -x virtiofsd 2>/dev/null); do dump_proc "$p" "virtiofsd"; done
-  pgrep -x virtiofsd >/dev/null 2>&1 || echo "    NONE RUNNING — the share is not mounted"
+  vfsd=$(find_by_exe virtiofsd) \
+    && for p in $vfsd; do dump_proc "$p" "virtiofsd"; done \
+    || echo "    NONE RUNNING — the share is not mounted"
   echo
   echo "--- 4. cowork-linux-helper ---"
-  for p in $(pgrep -f 'cowork-linux-helper' 2>/dev/null); do dump_proc "$p" "helper"; done
+  helper=$(find_by_exe cowork-linux-helper) \
+    && for p in $helper; do dump_proc "$p" "helper"; done \
+    || echo "    NONE RUNNING"
   echo
   echo "--- 5. vsock: kernel module and sockets ---"
   lsmod | grep -E '^(vsock|vhost_vsock|vmw_vsock)' | sed 's/^/    /'
@@ -86,9 +109,11 @@ else
   echo "############ NO VM AFTER ${DEADLINE}s ############"
   echo
   echo "--- processes that did exist ---"
-  pgrep -af 'cowork-linux-helper|virtiofsd' | sed 's/^/    /' || echo "    none"
-  echo "    (any qemu-system-x86_64 below without vhost-vsock is NOT ours:)"
-  pgrep -af qemu-system-x86_64 | sed 's/^/    /' || echo "    none"
+  for p in $(find_by_exe cowork-linux-helper) $(find_by_exe virtiofsd); do
+    dump_proc "$p" "$(basename "$(readlink "/proc/$p/exe" 2>/dev/null)")"
+  done
+  echo "    (any qemu below without a vhost-vsock device is NOT ours:)"
+  for p in $(find_by_exe qemu-system); do dump_proc "$p" "qemu"; done
 fi
 
 echo

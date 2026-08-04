@@ -379,6 +379,23 @@ degraded.
   for the probe's path literals, reconciled against `coworkProbe`, failing when
   the bundle names something the list does not. Not implemented.
 
+- **The Cowork guest sees the whole sandbox root, and this variant adds no
+  isolation of its own.** `cowork-linux-helper` starts `virtiofsd` with
+  `--shared-dir / --sandbox none`, observed on a live run. Inside the FHS mount
+  namespace that `/` is the sandbox root, which ro-binds the host's filesystem
+  entry by entry — so the guest's `claudeshared` tag is a view of your machine,
+  not of a project directory you picked.
+
+  This is upstream's choice, made by the shipped helper binary, and it is not
+  fixable from packaging: the arguments are constructed inside
+  `cowork-linux-helper`, and changing them means patching that binary or
+  `app.asar`, which this repo does not do for any reason. Worth stating plainly
+  because it is easy to assume a VM boundary implies a filesystem boundary here,
+  and it does not — the hypervisor isolates execution, not the share. If you
+  need the stronger property, the containing bubblewrap composition is where it
+  would have to come from, and this output does not add one beyond what
+  `buildFHSEnv` already does.
+
 ## Cowork
 
 `packages.claude-desktop-cowork` is the FHS variant plus the three host-side
@@ -388,12 +405,21 @@ and because wanting `npx` to resolve says nothing about wanting a hypervisor.
 
 **Verification status.** `checks.cowork-fhs-paths` proves the sandbox presents
 every path the probe searches and that the QEMU carried can create every device
-the helper asks for. Separately, a QEMU booted inside this exact sandbox
-composition — real KVM vCPUs, a `vhost-vsock-pci` device, a live `virtiofsd`,
-OVMF executing to the point of PXE fallback. What is *not* yet asserted anywhere
-is the end-to-end path through the app itself: gate → helper → bundle download →
-`startVM`. Treat this output as wired and mechanically verified, not as
-end-to-end proven.
+the helper asks for.
+
+The end-to-end path through the app — gate → helper → bundle download →
+`startVM` → booted guest — has been exercised by hand and evidenced: a
+`qemu-system-x86_64 -name claude-cowork-vm` with `accel=kvm`, two live
+`anon_inode:kvm-vcpu` fds, `/dev/vhost-vsock` open, an ESTABLISHED `v_str`
+connection between host CID 2 and the guest, a running `virtiofsd`, and
+`/usr/share/OVMF/OVMF_CODE_4M.fd` — this repo's `pkgs/ovmf-fhs.nix` — loaded as
+the read-only `pflash` half. The guest reached Ubuntu 24.04 userspace and its
+systemd logged `Detected virtualization kvm`.
+
+That run is reproducible via `t14/` (see `t14/README.md`), but it is a manual
+GUI test, not a check: nothing in CI or `nix flake check` re-runs it. On an
+upstream bump that touches Cowork it has to be re-run by hand, and until it is,
+the end-to-end claim describes the previous version.
 
 Why it cannot be a wrapper on `packages.default`: the app's probe resolves
 `qemuPath` by walking `$PATH`, but resolves `firmwarePath` and `virtiofsdPath`
@@ -426,22 +452,44 @@ all. The `ENOENT` is read as *"the kernel doesn't include the virtualization
 support Cowork needs, and it can't be added manually"*, which is wrong here and
 sends you debugging the wrong layer.
 
-The first run downloads the guest root filesystem (`rootfs.img`, ~27 MB
-compressed) from `downloads.claude.ai` into
-`$XDG_CONFIG_HOME/Claude/vm_bundles/`. It is not shipped in the `.deb`; the
-bundled `smol-bin.x64.img` is a read-only FAT32 side-disk of guest daemons that
-the VM mounts *after* booting, not the boot image.
+**Disk space — budget ~15 GB before the first Cowork session.** The guest root
+filesystem is not shipped in the `.deb`; the first run downloads it from
+`downloads.claude.ai` into `$XDG_CONFIG_HOME/Claude/vm_bundles/`:
+
+| file | size |
+| --- | --- |
+| `rootfs.img.zst` (the download) | 1.24 GiB |
+| `rootfs.img` (decompressed) | 10 GiB sparse |
+| `sessiondata.img` (created locally) | 10 GiB sparse |
+| `efivars.fd` | 528 KiB |
+
+Measured on a real first run: **~13 GB actually occupied**, ~23 GB apparent —
+the two images are sparse, so `du --apparent-size` and `df` disagree by a lot.
+Point `$XDG_CONFIG_HOME` somewhere with room; a small `/tmp`, a tmpfs, or a
+size-capped home partition will fail partway through the download or the
+decompression rather than up front.
+
+The bundled `smol-bin.x64.img` is a read-only FAT32 side-disk of guest daemons
+that the VM mounts *after* booting, not the boot image.
 
 `leanQemu` builds a trimmed headless QEMU instead of `qemu_kvm`, dropping the
 display, audio and smartcard front-ends a vsock-driven VM never touches. It
 roughly halves the marginal closure (446 MiB instead of 859 MiB over the FHS
 variant — most of the difference is `clang` and `llvm`, pulled in by
 `pipewire` → `ffmpeg`), at the cost of a source build that no cache carries.
-Off by default:
+
+**On by default.** Everything the helper's argv names survives the trim, and
+that claim is held to the trimmed binary itself by `checks.cowork-fhs-paths`
+rather than to the untrimmed one where it could not fail. A guest has been
+booted end to end on it. If you would rather have the cached `qemu_kvm` and a
+faster first build:
 
 ```nix
-claude-desktop-cowork.override { leanQemu = true; }
+claude-desktop-cowork.override { leanQemu = false; }
 ```
+
+That path stays evaluated by `checks.cowork-fhs-paths-full-qemu`, so it cannot
+rot unnoticed.
 
 ## Licence
 
