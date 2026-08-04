@@ -9,14 +9,20 @@ set -uo pipefail
 
 ROOT=${COWORK_TEST_ROOT:-/tmp/cowork-t14}
 DEADLINE=${COWORK_TEST_DEADLINE:-900}   # seconds to wait for a VM
-REPORT="$ROOT/t14-evidence.txt"
+
+# Beside the profile, never inside it. The documented cleanup for this test is
+# `rm -rf $ROOT`, so a report written under $ROOT is destroyed by the very step
+# the README tells you to run — which is how the first green lean run lost its
+# evidence. $ROOT=/tmp/cowork-t14 puts this at /tmp/cowork-t14-evidence.txt.
+REPORT=${COWORK_TEST_REPORT:-${ROOT%/}-evidence.txt}
 LOGDIR="$ROOT/config/Claude/logs"
 
-mkdir -p "$ROOT"
+mkdir -p "$ROOT" "$(dirname "$REPORT")"
 exec > >(tee "$REPORT") 2>&1
 
 echo "=== T1.4 evidence — started $(date -Is) ==="
 echo "profile root: $ROOT"
+echo "report:       $REPORT  (outside the profile; survives cleanup)"
 echo "waiting up to ${DEADLINE}s for a Cowork VM to appear"
 echo
 

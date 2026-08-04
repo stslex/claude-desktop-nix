@@ -55,7 +55,10 @@ first use, decompressing to a 10 GiB sparse `rootfs.img` alongside a 10 GiB
 sparse `sessiondata.img` created locally. Measured: **~13 GB actually occupied**,
 ~23 GB apparent.
 
-The report is written to `/tmp/cowork-t14/t14-evidence.txt`.
+The report is written to `/tmp/cowork-t14-evidence.txt` — deliberately *beside*
+the throwaway profile rather than inside it, so that `rm -rf /tmp/cowork-t14`
+does not delete the evidence the run was performed to produce. Override with
+`COWORK_TEST_REPORT`.
 
 **What counts as success.** Not the feature gate opening — a QEMU process
 carrying a `vhost-vsock-pci` device, holding `anon_inode:kvm-vcpu:*` fds, with a
