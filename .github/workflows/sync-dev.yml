@@ -1,0 +1,105 @@
+name: sync dev
+
+# Merge `main` back into `dev` whenever main moves.
+#
+# Why this exists: the updater lands the dev bump directly on `dev` but routes
+# the stable bump through a PR into `main`. That asymmetry means every merge
+# into main — a bump, a packaging fix, a README edit — is a commit `dev` does
+# not have. Nothing in the update workflow ever carries it back, so without
+# this job `dev` drifts *behind* `main` and the dev channel ends up testing
+# older packaging than stable ships. That inverts the channel's entire premise
+# (README, "Channels": packaging changes run on dev *before* they land on
+# main), and it does it silently — the branch still builds, still passes every
+# guard, and is simply testing the wrong tree.
+#
+# The failure mode is not hypothetical: `dev` was already one commit behind
+# `main` when this workflow was written.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Shared with update.yml — see the note there. Both workflows push to `dev`,
+# and a scheduled bump landing on dev while this job is merging into it is a
+# non-fast-forward push and a red run that means nothing.
+concurrency:
+  group: branch-writes
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: dev
+          # Full history: merge-base needs it, and a shallow clone turns an
+          # ordinary merge into a spurious conflict.
+          fetch-depth: 0
+
+      - name: Merge main into dev
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags origin main
+
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo "dev already contains every commit on main — nothing to do."
+            exit 0
+          fi
+
+          if git merge --no-edit origin/main; then
+            git push origin HEAD:dev
+            echo "Merged main into dev."
+            exit 0
+          fi
+
+          # One conflict has a known-correct resolution, and it is the one this
+          # setup produces on a schedule: both branches carry an automated bump
+          # of sources.json, so if main was merged in a window where dev had
+          # already moved on to a newer upstream version, the same three lines
+          # differ on both sides.
+          #
+          # Resolving it is *not* "always keep dev" — dev is usually ahead, but
+          # a dev leg that failed its build on the day stable landed leaves dev
+          # behind, and blindly keeping dev's side would silently revert main's
+          # bump. Compare the versions and keep the newer one, whichever side
+          # it came from.
+          conflicts="$(git diff --name-only --diff-filter=U)"
+          if [ "$conflicts" != "sources.json" ]; then
+            git merge --abort
+            echo "::error::main -> dev merge has conflicts outside sources.json; resolve by hand."
+            printf '%s\n' "$conflicts"
+            exit 1
+          fi
+
+          ours="$(git show :2:sources.json | jq -r .version)"
+          theirs="$(git show :3:sources.json | jq -r .version)"
+          newest="$(printf '%s\n%s\n' "$ours" "$theirs" | sort -V | tail -1)"
+          echo "sources.json conflict: dev=$ours main=$theirs -> keeping $newest"
+
+          if [ "$newest" = "$ours" ]; then
+            git checkout --ours -- sources.json
+          else
+            git checkout --theirs -- sources.json
+          fi
+          git add sources.json
+          git commit --no-edit
+          git push origin HEAD:dev
+          echo "Merged main into dev, keeping sources.json $newest."
+
+      - name: Verify dev is no longer behind main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main dev
+          behind="$(git rev-list --count origin/dev..origin/main)"
+          test "$behind" -eq 0 || {
+            echo "::error::dev is still $behind commit(s) behind main after the merge."
+            exit 1
+          }
+          echo "dev contains main."

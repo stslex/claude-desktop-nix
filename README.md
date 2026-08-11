@@ -44,8 +44,12 @@ build. It means a different **packaging branch**:
 
 | Channel | Branch | Output | Version |
 | --- | --- | --- | --- |
-| stable | `main` | `packages.default`, `packages.claude-desktop` | `1.24012.9` |
-| dev | `dev` | `packages.claude-desktop-dev` | `1.24012.9-pre.dev.<rev>` |
+| stable | `main` | `packages.default`, `packages.claude-desktop` | `<upstream>` |
+| dev | `dev` | `packages.claude-desktop-dev` | `<upstream>-pre.dev.<rev>` |
+
+`<upstream>` is whatever `sources.json` on that branch currently carries;
+the updater moves it daily, so a literal version here would be wrong within
+a week of being written.
 
 Both build the same upstream `.deb`. The dev channel exists so packaging changes
 can be installed and actually run before they land on `main` — the app is the
@@ -61,10 +65,14 @@ Three properties are deliberate:
   Nix, so `compareVersions "1.24012.9-pre.dev.abc" "1.24012.9" == -1`. A stable
   consumer with both overlays in scope cannot resolve to the dev build by
   accident. (A `-dev.` suffix sorts the other way — measured, not assumed.)
-- **Both channels keep tracking upstream.** The updater runs one matrix leg per
-  channel on its daily schedule, so `dev` does not freeze at whatever upstream
-  version was current when it was last merged. A channel nobody bumps is a
-  channel that silently tests an old app.
+- **Both channels keep tracking upstream, by different routes.** The updater
+  runs one matrix leg per channel on its daily schedule, so `dev` does not
+  freeze at whatever upstream version was current when it was last merged. A
+  channel nobody bumps is a channel that silently tests an old app. The dev
+  leg commits its bump straight to `dev`; the stable leg opens a PR against
+  `main`, because `main` is what consumers pin. `sync-dev` then merges `main`
+  back into `dev`, so the branch that is supposed to run *ahead* of stable can
+  never quietly fall behind it.
 
 Consuming the dev channel:
 
@@ -280,9 +288,35 @@ this package declined to satisfy.
 **cross-checks the download hash against the SHA256 the signed index
 advertises**, and rewrites `sources.json`. A divergence is a hard failure.
 
-`.github/workflows/update.yml` runs it daily and on demand. It opens a PR only
-after `nix build .#default` and `nix flake check` both pass — a version that
-bumps cleanly but builds broken fails the workflow instead of producing a red PR.
+`.github/workflows/update.yml` runs it daily and on demand, one matrix leg per
+channel. Nothing lands until `nix build .#default`, the dlopen-RUNPATH guard
+and `nix flake check` have all passed on the new version — a version that bumps
+cleanly but builds broken fails the workflow and leaves the branch untouched.
+
+Where a verified bump lands differs by channel:
+
+| Channel | Lands as | Why |
+| --- | --- | --- |
+| dev | a commit pushed straight to `dev` | the channel exists to run *current* upstream, and a bump that waits on a human is a bump that defeats it |
+| stable | a PR against `main` | `main` is what consumers pin, so which upstream version it moves to is a decision rather than a schedule |
+
+Stable's PR uses a fixed `update/stable` branch, so there is exactly one open
+bump PR at a time and it always carries the newest version — rather than a
+queue of per-version PRs stacking up behind whichever one is unmerged.
+
+`.github/workflows/sync-dev.yml` merges `main` back into `dev` on every push to
+`main`. Without it `dev` accumulates a deficit against `main` — every merged
+PR, bump or packaging fix alike, is a commit dev lacks — and the dev channel
+ends up testing packaging older than stable ships. When both branches have
+bumped `sources.json` independently the merge keeps the newer version,
+whichever side it is on; a conflict in any other file fails the run for a
+human instead of being guessed at.
+
+One repository setting is load-bearing for the stable leg: **Settings → Actions
+→ General → Workflow permissions → "Allow GitHub Actions to create and approve
+pull requests"** must be on. It is off by default, and with it off the workflow
+pushes the branch successfully and then fails on the PR step alone — every
+guard green, no PR, and the bump stranded on a branch nobody looks at.
 
 ## Testing this package without touching your profile
 
