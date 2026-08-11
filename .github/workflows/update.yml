@@ -2,23 +2,47 @@ name: update
 
 # Bump sources.json to the newest amd64 build in Anthropic's APT index.
 #
-# The contract this workflow enforces: a PR is opened only if the new version
+# The contract this workflow enforces: a bump lands only if the new version
 # *actually builds*. A hash bump that produces a broken derivation must fail
-# the run and leave the repository untouched — never open a PR that a human
-# then has to discover is red.
+# the run and leave the repository untouched — never hand a human a red branch
+# to discover later.
+#
+# Where it lands differs by channel, because the channels have different jobs:
+#
+#   dev    — committed straight to the branch. The README's argument for this
+#            channel is that it tests packaging against *current* upstream, so
+#            a bump that waits on a human is a bump that defeats the channel.
+#   stable — opened as a PR against main. main is what consumers pin, and a
+#            consumer's own flake.lock is the gate that actually decides when
+#            the new version reaches a machine; the PR is where you say "this
+#            upstream version, yes" before that gate is even in play.
+#
+# `dev` is kept at or ahead of `main` by .github/workflows/sync-dev.yml, which
+# merges main back into dev whenever main moves. Without that, dev drifts
+# *behind* stable and quietly tests older packaging than main ships — the exact
+# failure the channel exists to prevent.
 on:
   schedule:
     # Daily at 05:17 UTC. Off-the-hour to avoid the cron thundering herd.
     - cron: "17 5 * * *"
   workflow_dispatch:
 
-# Needed by peter-evans/create-pull-request.
+# contents: write pushes the dev bump; pull-requests: write opens the stable PR
+# via peter-evans/create-pull-request.
+#
+# Note that pull-requests: write is necessary but not sufficient: creating a PR
+# from a workflow is *also* gated on the repository-level "Allow GitHub Actions
+# to create and approve pull requests" setting, which is off by default. With
+# it off this workflow pushes the branch fine and then fails on the PR step.
 permissions:
   contents: write
   pull-requests: write
 
+# Shared with sync-dev.yml on purpose — the name is the queue. Both workflows
+# push to `dev`, so letting them overlap invites a non-fast-forward push and a
+# red run that means nothing except that two writers raced.
 concurrency:
-  group: update
+  group: branch-writes
   cancel-in-progress: false
 
 jobs:
@@ -49,23 +73,25 @@ jobs:
           || fromJSON('[{"channel":"dev","branch":"dev"}]')) }}
     name: update (${{ matrix.channel }})
     runs-on: ubuntu-latest
+
+    env:
+      # The one ref this leg verifies *and* writes. Both are derived from this
+      # single value deliberately: the tree the guards run against and the
+      # branch the bump lands on must not be allowed to drift apart, or the
+      # contract at the top of this file gets enforced against a tree that is
+      # not the one being changed.
+      #
+      # A scheduled run takes the channel's branch. A manual dispatch takes the
+      # ref it was dispatched from, so the updater can be exercised end to end
+      # on a throwaway branch without touching dev or main. For the stable leg
+      # the two are always the same string anyway — the matrix above only
+      # selects that leg on a dispatch when the ref already *is* main.
+      TARGET_REF: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || matrix.branch }}
+
     steps:
       - uses: actions/checkout@v5
         with:
-          # Paired with `base: ${{ matrix.branch }}` on the PR step below, and
-          # only correct as a pair. create-pull-request branches from `base`,
-          # not from whatever is checked out here, so these two decide
-          # different things: `base` picks the branch the bump lands on, this
-          # picks the tree the build and the guards run against. A scheduled
-          # run defaults to the repository's default branch (main), so changing
-          # `base` alone would verify main's tree and then open the PR against
-          # another branch — the contract at the top of this file would still
-          # be enforced, just against a tree the PR does not modify.
-          #
-          # A manual dispatch uses the ref it was dispatched from instead, so
-          # the updater can be exercised end to end from a branch before that
-          # branch is merged.
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || matrix.branch }}
+          ref: ${{ env.TARGET_REF }}
 
       - uses: DeterminateSystems/nix-installer-action@main
         with:
@@ -142,22 +168,48 @@ jobs:
           set -euo pipefail
           nix flake check -L
 
+      # Both landing steps sit below every guard, so the contract at the top of
+      # this file holds for either path: a broken build leaves the branch
+      # exactly where it was.
+
+      - name: Land the bump on dev
+        if: matrix.channel == 'dev' && steps.bump.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Staged by path rather than `commit -a`: update.sh should only ever
+          # touch sources.json, and if it ever touches something else that is a
+          # bug to surface, not to sweep into the bump commit.
+          git add sources.json
+          git commit -m "claude-desktop: ${{ steps.bump.outputs.version }}"
+          git push origin "HEAD:$TARGET_REF"
+
       - name: Open pull request
-        if: steps.bump.outputs.changed == 'true'
+        if: matrix.channel == 'stable' && steps.bump.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v8
         with:
-          # The channel is in the branch name because both legs can land on the
-          # same upstream version on the same day, and two legs pushing one
-          # branch would race.
-          branch: update/${{ matrix.channel }}/claude-desktop-${{ steps.bump.outputs.version }}
-          base: ${{ matrix.branch }}
+          # A fixed branch name, not one per version. create-pull-request
+          # updates the existing PR when the branch already exists, so stable
+          # has exactly one open bump PR at all times and it always carries the
+          # newest version — rather than a new PR per bump piling up behind
+          # whichever one you have not merged yet.
+          #
+          # This also keeps the sync-dev merge cheap: main lands on the same
+          # version dev already has, so sources.json is identical on both sides
+          # and merges without a conflict to resolve.
+          #
+          # Safe as a single branch only because the dev leg no longer opens a
+          # PR at all; when both legs did, one branch name for both would race.
+          branch: update/stable
+          base: ${{ env.TARGET_REF }}
           commit-message: "claude-desktop: ${{ steps.bump.outputs.version }}"
-          title: "claude-desktop: ${{ steps.bump.outputs.version }} (${{ matrix.channel }})"
+          title: "claude-desktop: ${{ steps.bump.outputs.version }} (stable)"
           delete-branch: true
           add-paths: |
             sources.json
           body: |
-            Automated bump of the **${{ matrix.channel }}** channel to
+            Automated bump of the **stable** channel to
             **${{ steps.bump.outputs.version }}**, from
             [Anthropic's APT index](https://downloads.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages).
 
@@ -167,6 +219,11 @@ jobs:
             - `nix build .#default` succeeds
             - the output has an executable wrapper, `chrome-sandbox`, and a desktop entry
             - `nix flake check` passes
+
+            The **dev** channel is already on this version — its leg commits
+            straight to `dev`, so it has been running against this build since
+            the bump. Merging here moves stable to the same upstream build, and
+            `sync-dev` then merges main back into dev.
 
             Upstream ships no changelog for the Linux builds, so there is
             nothing to link beyond the version bump itself.
