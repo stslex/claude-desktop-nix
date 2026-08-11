@@ -304,13 +304,45 @@ Stable's PR uses a fixed `update/stable` branch, so there is exactly one open
 bump PR at a time and it always carries the newest version — rather than a
 queue of per-version PRs stacking up behind whichever one is unmerged.
 
+The stable PR is opened by a separate job that runs only once the **whole**
+matrix is green, dev leg included. The two legs are otherwise independent, so
+without that gate a stable PR could be opened — claiming, in its own body, that
+dev is already on the version — while the dev leg was still building or had
+already failed. Stable would then be free to move first, which is the one thing
+the channel split exists to prevent. The PR body reports what `dev` is actually
+on at the time it is written, rather than what the design intends.
+
 `.github/workflows/sync-dev.yml` merges `main` back into `dev` on every push to
-`main`. Without it `dev` accumulates a deficit against `main` — every merged
-PR, bump or packaging fix alike, is a commit dev lacks — and the dev channel
-ends up testing packaging older than stable ships. When both branches have
-bumped `sources.json` independently the merge keeps the newer version,
-whichever side it is on; a conflict in any other file fails the run for a
-human instead of being guessed at.
+`main`, plus daily as a safety net for the runs that never happened. Without it
+`dev` accumulates a deficit against `main` — every merged PR, bump or packaging
+fix alike, is a commit dev lacks — and the dev channel ends up testing packaging
+older than stable ships.
+
+Its `sources.json` conflicts are resolved field by field rather than by keeping
+one side's file. Taking a whole file is only right when the two sides differ in
+nothing but the bump; the moment one adds a system or a field, the other side's
+file drops it *silently*, because the merge commit still lists both parents and
+every later check still passes.
+
+So only the fields a bump owns — the version, and each system's URL and hash —
+resolve automatically, and only where that is really the explanation: both
+sides must still have the field, and the two versions must actually differ, in
+which case the newer one wins. Everything else either side touched is carried
+through. A field one side deleted and the other edited, two different URLs
+under the *same* version, or any divergence outside the bump fields stops the
+run for a human — as does a conflict in any other file.
+
+The two workflows deliberately do **not** share a concurrency group even though
+both push to `dev`. A concurrency group is not a queue — it holds one running
+and one pending run, and a third arrival cancels the pending one — so sharing
+one would let a scheduled bump evict a sync that was waiting to carry a fresh
+`main` commit over. They resolve the race at the push instead: a rejected push
+means the branch moved, so `sync-dev` rebuilds its merge from the new tip and
+the updater re-runs `update.sh` against it. The updater re-derives rather than
+rebases because `sources.json` is nine lines long — git's line-based merge
+calls almost any two-sided edit a conflict, including edits that do not overlap
+semantically at all. Re-deriving reapplies the bump fields, keeps whatever else
+landed, and refuses to land anything but the version this run actually built.
 
 One repository setting is load-bearing for the stable leg: **Settings → Actions
 → General → Workflow permissions → "Allow GitHub Actions to create and approve

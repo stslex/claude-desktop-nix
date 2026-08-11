@@ -17,16 +17,36 @@ name: sync dev
 on:
   push:
     branches: [main]
+  # A safety net rather than the real trigger. The push above is what normally
+  # carries main over; the schedule catches the runs that never happened — one
+  # evicted from the queue, one cancelled mid-merge, one that went red on a
+  # transient failure and that nobody noticed. Ten minutes ahead of update.yml's
+  # 05:17 so `dev` goes into the daily bump already carrying main.
+  schedule:
+    - cron: "7 5 * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
 
-# Shared with update.yml — see the note there. Both workflows push to `dev`,
-# and a scheduled bump landing on dev while this job is merging into it is a
-# non-fast-forward push and a red run that means nothing.
+# Deliberately *not* a group shared with update.yml, even though both workflows
+# push to `dev`.
+#
+# A concurrency group holds one in-progress run and at most one *pending* run;
+# queuing a third cancels the pending one. `cancel-in-progress: false` only
+# protects the run that is already going — it does not make the group a queue.
+# So a shared group lets a scheduled bump evict a sync that was waiting to
+# carry a fresh main commit over, and that commit then sits unmerged until the
+# next push to main. Silent, and exactly the drift this workflow exists to stop.
+#
+# That same eviction is harmless *within* this workflow, which is why the group
+# is still shared between sync runs: every run merges whatever origin/main is
+# now into whatever dev is now, so the survivor does everything the evicted run
+# would have done. Serialization against update.yml is handled where it
+# actually matters instead — at the push, which rebuilds the merge on top of
+# whatever landed while this one was being prepared.
 concurrency:
-  group: branch-writes
+  group: sync-dev
   cancel-in-progress: false
 
 jobs:
@@ -41,65 +61,232 @@ jobs:
           fetch-depth: 0
 
       - name: Merge main into dev
+        id: merge
         run: |
           set -euo pipefail
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch --no-tags origin main
 
-          if git merge-base --is-ancestor origin/main HEAD; then
-            echo "dev already contains every commit on main — nothing to do."
-            exit 0
-          fi
+          workdir="$(mktemp -d)"
 
-          if git merge --no-edit origin/main; then
-            git push origin HEAD:dev
-            echo "Merged main into dev."
-            exit 0
-          fi
-
-          # One conflict has a known-correct resolution, and it is the one this
-          # setup produces on a schedule: both branches carry an automated bump
-          # of sources.json, so if main was merged in a window where dev had
-          # already moved on to a newer upstream version, the same three lines
-          # differ on both sides.
+          cat >"$workdir/merge.jq" <<'JQ'
+          # Three-way merge of sources.json, one leaf at a time.
           #
-          # Resolving it is *not* "always keep dev" — dev is usually ahead, but
-          # a dev leg that failed its build on the day stable landed leaves dev
-          # behind, and blindly keeping dev's side would silently revert main's
-          # bump. Compare the versions and keep the newer one, whichever side
-          # it came from.
-          conflicts="$(git diff --name-only --diff-filter=U)"
-          if [ "$conflicts" != "sources.json" ]; then
-            git merge --abort
-            echo "::error::main -> dev merge has conflicts outside sources.json; resolve by hand."
-            printf '%s\n' "$conflicts"
+          # `git checkout --ours/--theirs` takes a *whole file*, which is only
+          # right when the two sides differ in nothing but the automated bump.
+          # The moment one side adds a system, adds a field, or hand-fixes a
+          # URL, taking the other side's file drops that change — and drops it
+          # silently, because the merge commit still lists both parents and
+          # every later check still passes.
+          #
+          # So, per leaf: if only one side moved off the base, that side wins;
+          # if both moved to the same value, that value wins; if they moved
+          # apart, only the fields update.sh rewrites on a bump have an
+          # automatic answer (take the newer version's side), and anything else
+          # stops the run for a human.
+          #
+          # sources.json holds no JSON nulls, so "absent" and "null" are the
+          # same thing here — which is what makes a key deleted on one side
+          # stay deleted instead of being resurrected out of the base.
+
+          # Spelled out rather than the shorter `paths(scalars)`: `paths(f)`
+          # selects on the node's own truthiness, so `paths(scalars)` skips
+          # every `false` and `null` leaf. A field added as `false` on one side
+          # would vanish — the exact class of loss this filter exists to stop.
+          def leaves: paths(type != "object" and type != "array");
+
+          def is_bump_field:
+            . == ["version"]
+            or (length == 3 and .[0] == "systems" and (.[2] == "url" or .[2] == "hash"));
+
+          # "tie" seeds the document from ours purely so key order stays put;
+          # it never wins a divergence.
+          def winning_side($o; $t): if $winner == "theirs" then $t else $o end;
+
+          # A key that is an object on one side and a scalar on the other is a
+          # reshape rather than a field edit, and `getpath` errors on it rather
+          # than returning null. Catch that and hand the file to a human down
+          # the same path as any other unresolvable difference.
+          try
+          ( [ ($base | leaves), ($ours | leaves), ($theirs | leaves) ]
+          | unique
+          # Seeded from the winning side rather than from `{}` so the result
+          # keeps that side's key order: a resolution should read as a
+          # three-line diff, not as a reshuffle of the whole file.
+          | reduce .[] as $p
+              ( { doc: winning_side($ours; $theirs), drop: [], conflicts: [] }
+              ; ( ($base   | getpath($p)) as $b
+                | ($ours   | getpath($p)) as $o
+                | ($theirs | getpath($p)) as $t
+                | if   $o == $t             then { take: $o }
+                  elif $o == $b             then { take: $t }
+                  elif $t == $b             then { take: $o }
+                  # A bump is the only thing resolvable without a human, and
+                  # only when it really is one: both sides must still have the
+                  # field (a delete against an edit is a disagreement, not a
+                  # bump) and the two versions must actually differ (equal
+                  # versions give no reason to prefer either side's url).
+                  elif ($p | is_bump_field) and $winner != "tie"
+                       and $o != null and $t != null
+                                            then { take: winning_side($o; $t) }
+                  else                           { conflict: ($p | join(".")) }
+                  end
+                ) as $r
+              | if   $r.conflict != null then .conflicts += [$r.conflict]
+                elif $r.take == null     then .drop += [$p]
+                else .doc |= setpath($p; $r.take)
+                end
+              )
+          | . as $r
+          | { doc:
+                ( $r.doc
+                | delpaths($r.drop)
+                # A system whose every field was deleted on one side leaves an
+                # empty object behind; drop it rather than commit `"x": {}`.
+                | if (.systems | type) == "object"
+                  then .systems |= with_entries(select(.value != {}))
+                  else . end
+                )
+            , conflicts: $r.conflicts
+            }
+          )
+          catch
+            { doc: null
+            , conflicts: ["sources.json cannot be merged field by field (" + tostring + ")"]
+            }
+          JQ
+
+          resolve_sources() {
+            local ours theirs winner side result conflicts
+
+            # Stage 1 is missing when sources.json was added on both sides;
+            # an empty base makes every field look like a two-sided add, which
+            # is the correct reading of that history.
+            git show :1:sources.json >"$workdir/base.json" 2>/dev/null \
+              || printf '{}\n' >"$workdir/base.json"
+            git show :2:sources.json >"$workdir/ours.json"
+            git show :3:sources.json >"$workdir/theirs.json"
+
+            ours="$(jq -r '.version // ""' "$workdir/ours.json")"
+            theirs="$(jq -r '.version // ""' "$workdir/theirs.json")"
+
+            # Not "always keep dev". dev is usually ahead, but a dev leg that
+            # failed its build on the day stable landed leaves dev behind, and
+            # keeping dev's side blindly would silently revert main's bump.
+            #
+            # Equal versions are a third case, not a tie to be broken: two sides
+            # carrying different URLs for the *same* version disagree about
+            # something a bump cannot explain, so nothing is resolved on that
+            # basis and the divergence goes to a human.
+            if [ "$ours" = "$theirs" ]; then
+              winner=tie
+              side="neither — both sides are on $ours"
+            elif [ "$(printf '%s\n%s\n' "$ours" "$theirs" | sort -V | tail -1)" = "$ours" ]; then
+              winner=ours
+              side=dev
+            else
+              winner=theirs
+              side=main
+            fi
+            echo "sources.json differs on both sides: dev=$ours main=$theirs" \
+                 "-> bump fields resolve to $side"
+
+            result="$(jq -n \
+              --argjson base   "$(cat "$workdir/base.json")" \
+              --argjson ours   "$(cat "$workdir/ours.json")" \
+              --argjson theirs "$(cat "$workdir/theirs.json")" \
+              --arg winner "$winner" \
+              -f "$workdir/merge.jq")"
+
+            conflicts="$(jq -r '.conflicts | join(", ")' <<<"$result")"
+            if [ -n "$conflicts" ]; then
+              echo "::error::sources.json changed on both sides outside the fields a bump rewrites ($conflicts); resolve by hand."
+              return 1
+            fi
+
+            jq '.doc' <<<"$result" >sources.json
+            git add sources.json
+          }
+
+          # A hard exit inside the loop below would leave that attempt's log
+          # group open — exactly when the log most needs to be readable.
+          group_open=false
+          open_group()  { echo "::group::$1"; group_open=true; }
+          close_group() {
+            if [ "$group_open" = true ]; then echo "::endgroup::"; group_open=false; fi
+          }
+          trap close_group EXIT
+
+          # Up to three attempts. update.yml pushes to `dev` too and the two
+          # are no longer serialized against each other (see the concurrency
+          # note above), so a rejected push just means dev moved while this
+          # merge was being prepared. The answer is to rebuild the merge from
+          # the new tip, not to fail a run that had nothing wrong with it.
+          synced=false
+          for attempt in 1 2 3; do
+            open_group "sync attempt $attempt"
+
+            git fetch --no-tags --force origin \
+              "+refs/heads/main:refs/remotes/origin/main" \
+              "+refs/heads/dev:refs/remotes/origin/dev"
+            git reset --hard origin/dev
+            git clean -fdq
+
+            if git merge-base --is-ancestor origin/main HEAD; then
+              echo "dev already contains every commit on main — nothing to do."
+              synced=true
+              close_group
+              break
+            fi
+
+            if ! git merge --no-edit origin/main; then
+              # The one conflict this setup produces on a schedule: both
+              # branches carry an automated bump of sources.json, so if main is
+              # merged in a window where dev has already moved on to a newer
+              # upstream version, the same fields differ on both sides.
+              conflicts="$(git diff --name-only --diff-filter=U)"
+              if [ "$conflicts" != "sources.json" ]; then
+                git merge --abort
+                echo "::error::main -> dev merge has conflicts outside sources.json; resolve by hand."
+                printf '%s\n' "$conflicts"
+                exit 1
+              fi
+              resolve_sources
+              git commit --no-edit
+            fi
+
+            if git push origin HEAD:dev; then
+              echo "Merged main into dev."
+              synced=true
+              close_group
+              break
+            fi
+
+            echo "push rejected — dev moved under this merge; rebuilding it from the new tip."
+            close_group
+          done
+
+          if [ "$synced" != true ]; then
+            echo "::error::could not push the main -> dev merge after 3 attempts."
             exit 1
           fi
 
-          ours="$(git show :2:sources.json | jq -r .version)"
-          theirs="$(git show :3:sources.json | jq -r .version)"
-          newest="$(printf '%s\n%s\n' "$ours" "$theirs" | sort -V | tail -1)"
-          echo "sources.json conflict: dev=$ours main=$theirs -> keeping $newest"
+          echo "main_sha=$(git rev-parse origin/main)" >>"$GITHUB_OUTPUT"
 
-          if [ "$newest" = "$ours" ]; then
-            git checkout --ours -- sources.json
-          else
-            git checkout --theirs -- sources.json
-          fi
-          git add sources.json
-          git commit --no-edit
-          git push origin HEAD:dev
-          echo "Merged main into dev, keeping sources.json $newest."
-
-      - name: Verify dev is no longer behind main
+      # Checks the commit this run actually merged, not whatever main is by the
+      # time the check runs: a push to main landing mid-sync is a normal event
+      # that triggers its own sync, and it must not turn this one red.
+      - name: Verify dev contains the main commit this run merged
+        env:
+          MAIN_SHA: ${{ steps.merge.outputs.main_sha }}
         run: |
           set -euo pipefail
-          git fetch --no-tags origin main dev
-          behind="$(git rev-list --count origin/dev..origin/main)"
-          test "$behind" -eq 0 || {
-            echo "::error::dev is still $behind commit(s) behind main after the merge."
+          git fetch --no-tags --force origin \
+            "+refs/heads/dev:refs/remotes/origin/dev"
+          if git merge-base --is-ancestor "$MAIN_SHA" origin/dev; then
+            echo "dev contains main @ $MAIN_SHA."
+          else
+            echo "::error::dev does not contain main @ $MAIN_SHA after the merge."
             exit 1
-          }
-          echo "dev contains main."
+          fi
