@@ -77,6 +77,38 @@ of whichever QEMU it found: a real Cowork VM is forked by
 `cowork-linux-helper`, and anything else named there means the argv matched for
 the wrong reason.
 
+## Sign-in opens a browser, and the browser has to be yours
+
+`t14-run.sh` resolves the host's default browser to an absolute path and seeds
+the throwaway `mimeapps.list` with it before starting the app. That is not
+tidiness — without it the test cannot be completed at all.
+
+Redirecting `XDG_CONFIG_HOME` moves the whole desktop-integration context, not
+just the app's profile. The throwaway config has no http/https association, so
+`xdg-open` inside the sandbox cannot find the browser you use and falls back to
+the first application registered for the scheme — launching it with the
+throwaway XDG dirs too, i.e. with an empty browser profile. Sign-in is an OAuth
+round trip through the system browser and only completes in a browser already
+signed in to the identity provider, so it fails there every time. Measured on
+2026-08-18: four attempts, four silent failures, and nothing in either log
+naming the cause.
+
+Naming the host's `.desktop` file would not have been enough either. This host's
+`zen.desktop` carries `Exec=zen --name zen %U` — a bare name resolved through
+PATH, and PATH inside the FHS sandbox is the sandbox's own, where no browser
+exists. That is exactly why the fallback had picked a chromium: its entry
+happened to carry an absolute store path.
+
+The other half of the round trip is on the host. The callback is a `claude://`
+deep link, and the browser resolves it through *your* desktop entries — which
+point at your normally installed Claude Desktop and its real profile, not at the
+instance under test. Handling that requires a temporary handler in
+`~/.local/share/applications`, which is outside this harness's blast radius and
+so is deliberately not automated: `rm -rf $ROOT` must remain the whole cleanup.
+Install one by hand if you need the callback to land in the test instance, and
+remember to remove it, or complete the sign-in and accept that the deep link
+opened your real app.
+
 ## Isolation and cleanup
 
 `t14-run.sh` redirects `XDG_{CONFIG,CACHE,DATA,STATE}_HOME` under

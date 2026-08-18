@@ -42,11 +42,103 @@ if running 'cowork-linux-helper' 2>/dev/null >/dev/null; then
   exit 1
 fi
 
+# --- carry the host's browser into the sandbox -------------------------------
+# XDG_CONFIG_HOME does not only move the app's profile: it moves the whole
+# desktop-integration context, mimeapps.list included. A throwaway config has no
+# http/https association at all, so `xdg-open` inside the sandbox cannot find
+# the browser you actually use. It falls back to the first application
+# registered for the scheme — and launches it with the throwaway XDG dirs too,
+# i.e. with an empty browser profile.
+#
+# That is fatal for this test rather than untidy. Sign-in is an OAuth round trip
+# through the system browser and only completes in a browser already signed in
+# to the identity provider. Observed on 2026-08-18: the app opened a chromium
+# with --database=$ROOT/config/chromium/Crashpad — a profile created seconds
+# earlier — and the claude:// callback never came back. Four attempts, four
+# failures, and nothing in either log said why.
+#
+# Naming the host's .desktop file is not enough either. This host's
+# zen.desktop carries `Exec=zen --name zen %U`, a bare name resolved through
+# PATH, and PATH inside the FHS sandbox is the sandbox's own — the browser is
+# not in targetPkgs and never will be. That is precisely why chromium won the
+# fallback: its entry happened to carry an absolute store path. So resolve the
+# browser to an absolute path here, on the host, and hand the sandbox an entry
+# it can actually execute.
+host_browser=$(xdg-settings get default-web-browser 2>/dev/null || true)
+if [ -z "${host_browser:-}" ]; then
+  host_browser=$(sed -n 's/^x-scheme-handler\/https=//p' \
+    "${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list" 2>/dev/null | head -1)
+fi
+host_browser=${host_browser%;}
+
+browser_exec=""
+if [ -n "$host_browser" ]; then
+  IFS=: read -r -a _datadirs <<<"${XDG_DATA_HOME:-$HOME/.local/share}:$XDG_DATA_DIRS"
+  for _d in "${_datadirs[@]}"; do
+    [ -f "$_d/applications/$host_browser" ] || continue
+    _exec=$(sed -n 's/^Exec=//p' "$_d/applications/$host_browser" | head -1)
+    _cmd=${_exec%% *}
+    case "$_cmd" in
+      /*) browser_exec=$_cmd ;;
+      *)  browser_exec=$(command -v "$_cmd" 2>/dev/null || true) ;;
+    esac
+    break
+  done
+fi
+
 PKG=$(nix build --no-link --print-out-paths "$REPO#claude-desktop-cowork")
 echo "package: $PKG"
 echo "profile: $ROOT   (delete this directory to undo the test)"
 
-mkdir -p "$ROOT"/{config,cache,data,state}
+mkdir -p "$ROOT"/{config,cache,data,state} "$ROOT/data/applications"
+
+if [ -n "$browser_exec" ]; then
+  echo "browser: $browser_exec   (carried over from the host as $host_browser)"
+
+  # Its own entry under the throwaway XDG_DATA_HOME rather than a copy of the
+  # host's, so the file the sandbox reads is one this script fully controls and
+  # `rm -rf $ROOT` still undoes everything.
+  cat > "$ROOT/data/applications/t14-host-browser.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Host browser (T1.4)
+Exec=$browser_exec %U
+NoDisplay=true
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
+DESKTOP
+
+  mimeapps="$ROOT/config/mimeapps.list"
+  if ! grep -q '^x-scheme-handler/https=' "$mimeapps" 2>/dev/null; then
+    if [ -f "$mimeapps" ] && grep -q '^\[Default Applications\]' "$mimeapps"; then
+      # Insert under the group that is already there. Appending a second
+      # [Default Applications] header instead would make GLib's key-file parser
+      # reject the whole file, which fails closed in the worst way: every
+      # association disappears, including the claude:// one the app wrote.
+      tmp=$(mktemp)
+      awk '
+        { print }
+        /^\[Default Applications\]$/ && !seeded {
+          print "x-scheme-handler/http=t14-host-browser.desktop"
+          print "x-scheme-handler/https=t14-host-browser.desktop"
+          print "text/html=t14-host-browser.desktop"
+          seeded = 1
+        }' "$mimeapps" > "$tmp" && mv "$tmp" "$mimeapps"
+    else
+      cat >> "$mimeapps" <<'MIME'
+[Default Applications]
+x-scheme-handler/http=t14-host-browser.desktop
+x-scheme-handler/https=t14-host-browser.desktop
+text/html=t14-host-browser.desktop
+MIME
+    fi
+  fi
+else
+  echo "WARNING: could not resolve the host's browser to an absolute path." >&2
+  echo "         Sign-in will open whatever xdg-open falls back to, probably" >&2
+  echo "         with an empty profile, and the OAuth round trip will not" >&2
+  echo "         finish. See the comment above this warning." >&2
+fi
+
 export XDG_CONFIG_HOME="$ROOT/config"
 export XDG_CACHE_HOME="$ROOT/cache"
 export XDG_DATA_HOME="$ROOT/data"
