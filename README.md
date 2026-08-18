@@ -23,7 +23,7 @@ $ nix run github:<you>/claude-desktop-nix
 | `overlays.default` | Adds `claude-desktop`, `claude-desktop-fhs`, `claude-desktop-cowork` and the `-dev` counterparts to a nixpkgs instance. |
 | `checks.wrapper-flags` | Asserts the wrapper keeps its flags, never gains `--no-sandbox`, ships `chrome-sandbox`, and has a valid desktop entry with rewritten `Exec=` lines. |
 | `checks.dlopen-runpath` | Scans every shipped ELF for soname strings and asserts that each library this package provides resolves from the RUNPATH of every object naming it, that nothing on the lists has stopped being named, and that nothing *new* is named without being classified. See [Dependency provenance](#dependency-provenance). |
-| `checks.cowork-fhs-paths` / `-lean` | Asserts the Cowork sandbox presents every path the app's VM probe searches, that the OVMF code file has its matching vars file, and that the QEMU carried can actually create the devices the helper asks for. Run against both the cached and the trimmed QEMU. |
+| `checks.cowork-fhs-paths` / `-full-qemu` | Asserts the Cowork sandbox presents every path the app's VM probe searches, that the OVMF code file has its matching vars file, and that the QEMU carried can actually create the devices the helper asks for. The unsuffixed one runs against the trimmed QEMU the package actually ships; `-full-qemu` runs the same assertions against the cached `qemu_kvm` that `leanQemu = false` selects. |
 
 ### NixOS
 
@@ -292,8 +292,15 @@ advertises**, and rewrites `sources.json`. A divergence is a hard failure.
 
 `.github/workflows/update.yml` runs it daily and on demand, one matrix leg per
 channel. Nothing lands until `nix build .#default`, the dlopen-RUNPATH guard
-and `nix flake check` have all passed on the new version — a version that bumps
+and every flake check have all passed on the new version — a version that bumps
 cleanly but builds broken fails the workflow and leaves the branch untouched.
+
+The checks are named one by one rather than run through `nix flake check`,
+which offers no way to skip a single check, and skipping exactly one of them —
+`cowork-fhs-paths`, which compiles QEMU from source — is the whole point. See
+[Verification](#verification) for why leaving it out costs a bump nothing, and
+for the guard that stops the hand-written list from quietly falling behind
+`flake.nix`.
 
 Where a verified bump lands differs by channel:
 
@@ -341,7 +348,7 @@ one would let a scheduled bump evict a sync that was waiting to carry a fresh
 `main` commit over. They resolve the race at the push instead: a rejected push
 means the branch moved, so `sync-dev` rebuilds its merge from the new tip and
 the updater re-runs `update.sh` against it. The updater re-derives rather than
-rebases because `sources.json` is nine lines long — git's line-based merge
+rebases because `sources.json` is ten lines long — git's line-based merge
 calls almost any two-sided edit a conflict, including edits that do not overlap
 semantically at all. Re-deriving reapplies the bump fields, keeps whatever else
 landed, and refuses to land anything but the version this run actually built.
@@ -351,6 +358,54 @@ One repository setting is load-bearing for the stable leg: **Settings → Action
 pull requests"** must be on. It is off by default, and with it off the workflow
 pushes the branch successfully and then fails on the PR step alone — every
 guard green, no PR, and the bump stranded on a branch nobody looks at.
+
+## Verification
+
+`.github/workflows/ci.yml` builds and checks a tree on every pull request and
+on every push to `main` or `dev`. Until it existed this repository had no
+push/PR CI at all: the only thing that ever built anything was the daily
+updater, so a commit stayed unverified until the next upstream bump happened to
+trip over it — and the bump, not the commit, is what looked broken.
+
+Branches are covered by their pull request rather than by their pushes, because
+covering both is not free. The two events produce different `github.ref`
+values, so no concurrency group can collapse them, and each run carries its own
+copy of the expensive job below. The cost of that rule is that a branch with no
+PR open gets no CI.
+
+It runs as two jobs, and the split is about exactly one derivation.
+`checks.cowork-fhs-paths` asserts against the trimmed QEMU — `qemu.override
+{ hostCpuOnly = true; … }` — and an override is a derivation no binary cache
+carries, so every run that needs it compiles QEMU from source. Measured, on a
+GitHub-hosted `ubuntu-24.04` runner with no cache: **10m05s** of QEMU and
+11m40s for the job, against ~18 minutes on this repository's own hardware.
+Everything a cache can serve stays in the other job, which finishes in about
+90 seconds.
+
+So the expensive job runs only when something it tests has moved: `flake.lock`,
+`flake.nix`, `pkgs/claude-desktop-fhs.nix` or `pkgs/cowork-fhs-paths.nix`.
+`sources.json` is deliberately not on that list — an upstream bump changes the
+app payload, not the QEMU, and `cowork-fhs-paths-full-qemu` re-runs every path
+assertion against the new rootfs on the cached QEMU anyway. When the gate
+cannot resolve its base commit at all — a new branch, a force-push — it runs
+the check rather than guessing.
+
+Two things keep that arrangement from silently covering less than it says:
+
+- **The gate is only allowed to skip work it can prove is unnecessary, and a
+  cancelled run can't prove anything.** A pull request's gate diffs against
+  `origin/<base>`, a fixed point, so superseding a run loses nothing. A push's
+  gate diffs against the tip immediately before that push, so cancelling one
+  loses the coverage permanently: the next push diffs from the commit whose
+  check never ran, sees nothing tracked move, and skips — and the unverified
+  change then sits in the baseline of every future diff. `dev` takes two
+  unattended pushes ten minutes apart daily, against a job that runs twelve, so
+  push runs are keyed per commit and only pull requests supersede each other.
+- **`.github/scripts/checks-accounted-for.sh`** compares `flake.nix`'s `checks`
+  attrset against the list each workflow names, and fails when they differ. A
+  check added to the flake and forgotten in a workflow would otherwise never
+  run, never be reported, and — in the updater's case — be contradicted by the
+  stable PR body, which tells its reader every check passed.
 
 ## Testing this package without touching your profile
 

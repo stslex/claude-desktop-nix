@@ -57,8 +57,8 @@
   # Everything the helper's argv actually names (q35, kvm, virtio-blk-pci,
   # vhost-vsock-pci, vhost-user-fs-pci, virtio-net-pci, virtio-rng-pci,
   # virtio-serial, memory-backend-memfd, `-netdev user` via libslirp) survives —
-  # and checks.cowork-fhs-paths-lean holds that claim to the trimmed binary
-  # itself, rather than to the untrimmed one where it could not fail.
+  # and checks.cowork-fhs-paths holds that claim to the trimmed binary itself,
+  # rather than to the untrimmed one where it could not fail.
   leanQemu ? false,
 }:
 
@@ -246,8 +246,9 @@ buildFHSEnv {
     # create a vhost-vsock device produces a *passing* Cowork tab and a VM that
     # dies at boot. That is precisely the failure `leanQemu` could introduce by
     # trimming one option too many, which is why this list is asserted against
-    # both QEMUs — checks.cowork-fhs-paths and checks.cowork-fhs-paths-lean —
-    # rather than trusted.
+    # both QEMUs rather than trusted: checks.cowork-fhs-paths against the
+    # trimmed build this package ships, checks.cowork-fhs-paths-full-qemu
+    # against the cached one the `leanQemu = false` escape hatch selects.
     coworkQemuNeeds = {
       machines = [ "q35" ];
       accels = [ "kvm" ];
