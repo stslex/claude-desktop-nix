@@ -2,23 +2,57 @@ name: update
 
 # Bump sources.json to the newest amd64 build in Anthropic's APT index.
 #
-# The contract this workflow enforces: a PR is opened only if the new version
+# The contract this workflow enforces: a bump lands only if the new version
 # *actually builds*. A hash bump that produces a broken derivation must fail
-# the run and leave the repository untouched — never open a PR that a human
-# then has to discover is red.
+# the run and leave the repository untouched — never hand a human a red branch
+# to discover later.
+#
+# Where it lands differs by channel, because the channels have different jobs:
+#
+#   dev    — committed straight to the branch. The README's argument for this
+#            channel is that it tests packaging against *current* upstream, so
+#            a bump that waits on a human is a bump that defeats the channel.
+#   stable — opened as a PR against main. main is what consumers pin, and a
+#            consumer's own flake.lock is the gate that actually decides when
+#            the new version reaches a machine; the PR is where you say "this
+#            upstream version, yes" before that gate is even in play.
+#
+# `dev` is kept at or ahead of `main` by .github/workflows/sync-dev.yml, which
+# merges main back into dev whenever main moves. Without that, dev drifts
+# *behind* stable and quietly tests older packaging than main ships — the exact
+# failure the channel exists to prevent.
 on:
   schedule:
     # Daily at 05:17 UTC. Off-the-hour to avoid the cron thundering herd.
     - cron: "17 5 * * *"
   workflow_dispatch:
 
-# Needed by peter-evans/create-pull-request.
+# contents: write pushes the dev bump; pull-requests: write opens the stable PR
+# via peter-evans/create-pull-request.
+#
+# Note that pull-requests: write is necessary but not sufficient: creating a PR
+# from a workflow is *also* gated on the repository-level "Allow GitHub Actions
+# to create and approve pull requests" setting, which is off by default. With
+# it off this workflow pushes the branch fine and then fails on the PR step.
 permissions:
   contents: write
   pull-requests: write
 
+# Not shared with sync-dev.yml, though both workflows push to `dev`.
+#
+# A concurrency group is not a queue: it holds one in-progress run and at most
+# one *pending* run, and queuing a third cancels the pending one — which
+# `cancel-in-progress: false` does nothing about, since it only protects the
+# run already going. A group shared with sync-dev would therefore let this
+# workflow evict a sync waiting to carry a fresh `main` commit into `dev`, and
+# that commit would then sit unmerged until the next push to main.
+#
+# Splitting by event and ref keeps the same property here: a run only ever
+# evicts a pending run that was going to do the same thing to the same branch,
+# so the survivor subsumes it. Two runs that overlap now both push to `dev`,
+# which is handled at the push itself — see "Land the bump on dev".
 concurrency:
-  group: update
+  group: update-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -49,23 +83,29 @@ jobs:
           || fromJSON('[{"channel":"dev","branch":"dev"}]')) }}
     name: update (${{ matrix.channel }})
     runs-on: ubuntu-latest
+
+    env:
+      # The one ref this leg verifies *and* writes. Both are derived from this
+      # single value deliberately: the tree the guards run against and the
+      # branch the bump lands on must not be allowed to drift apart, or the
+      # contract at the top of this file gets enforced against a tree that is
+      # not the one being changed.
+      #
+      # A scheduled run takes the channel's branch. A manual dispatch takes the
+      # ref it was dispatched from, so the updater can be exercised end to end
+      # on a throwaway branch without touching dev or main. For the stable leg
+      # the two are always the same string anyway — the matrix above only
+      # selects that leg on a dispatch when the ref already *is* main.
+      TARGET_REF: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || matrix.branch }}
+
     steps:
       - uses: actions/checkout@v5
         with:
-          # Paired with `base: ${{ matrix.branch }}` on the PR step below, and
-          # only correct as a pair. create-pull-request branches from `base`,
-          # not from whatever is checked out here, so these two decide
-          # different things: `base` picks the branch the bump lands on, this
-          # picks the tree the build and the guards run against. A scheduled
-          # run defaults to the repository's default branch (main), so changing
-          # `base` alone would verify main's tree and then open the PR against
-          # another branch — the contract at the top of this file would still
-          # be enforced, just against a tree the PR does not modify.
-          #
-          # A manual dispatch uses the ref it was dispatched from instead, so
-          # the updater can be exercised end to end from a branch before that
-          # branch is merged.
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || matrix.branch }}
+          ref: ${{ env.TARGET_REF }}
+          # Full history: the dev leg re-points its branch at the remote tip
+          # when a push races sync-dev, and pushing out of a shallow clone is a
+          # sharp edge not worth having in the path that lands the bump.
+          fetch-depth: 0
 
       - uses: DeterminateSystems/nix-installer-action@main
         with:
@@ -142,31 +182,177 @@ jobs:
           set -euo pipefail
           nix flake check -L
 
+      # Both landing steps sit below every guard, so the contract at the top of
+      # this file holds for either path: a broken build leaves the branch
+      # exactly where it was.
+
+      - name: Land the bump on dev
+        if: matrix.channel == 'dev' && steps.bump.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Staged by path rather than `commit -a`: update.sh should only ever
+          # touch sources.json, and if it ever touches something else that is a
+          # bug to surface, not to sweep into the bump commit.
+          git add sources.json
+          git commit -m "claude-desktop: $VERSION"
+
+          # sync-dev.yml pushes to this branch too and is no longer serialized
+          # against this workflow (see the concurrency note above), so a rejected
+          # push means the branch moved during the ~20 minutes of building above.
+          # That is not a reason to discard a run that proved the version works.
+          #
+          # The replay re-runs update.sh against the new tip rather than rebasing
+          # the bump commit onto it. sources.json is nine lines long, so git's
+          # line-based merge calls almost any two-sided edit a conflict — even
+          # edits that do not overlap semantically, like the new system a
+          # sync-dev merge may have carried over — and a conflicted rebase would
+          # end the step on the first retry. Re-deriving reapplies exactly the
+          # fields a bump owns, keeps whatever else landed, and answers "has
+          # someone already bumped this?" instead of guessing.
+          landed=false
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:$TARGET_REF"; then
+              landed=true
+              break
+            fi
+
+            echo "push rejected (attempt $attempt) — $TARGET_REF moved; re-deriving the bump on its new tip"
+            git fetch --no-tags --force origin \
+              "+refs/heads/$TARGET_REF:refs/remotes/origin/$TARGET_REF"
+            git reset --hard "origin/$TARGET_REF"
+
+            out="$(nix develop --command ./pkgs/update.sh)"
+            if grep -qx 'changed=false' <<<"$out"; then
+              echo "$TARGET_REF already carries $VERSION — nothing left to land."
+              landed=true
+              break
+            fi
+
+            # Never land a version other than the one the guards above built.
+            got="$(sed -n 's/^version=//p' <<<"$out")"
+            if [ "$got" != "$VERSION" ]; then
+              echo "::error::upstream moved from $VERSION to $got mid-run; refusing to land a version this run has not verified."
+              exit 1
+            fi
+
+            git add sources.json
+            git commit -m "claude-desktop: $VERSION"
+          done
+
+          if [ "$landed" != true ]; then
+            echo "::error::could not push the bump to $TARGET_REF after 3 attempts."
+            exit 1
+          fi
+
+      # The stable leg hands the verified file to the `stable-pr` job below
+      # instead of opening the PR itself. The artifact is the signal: it exists
+      # only when this leg both found a new version and passed every guard, so
+      # the PR job needs no separate "did anything change" output — which is
+      # just as well, since a matrix job's outputs are whatever the last leg to
+      # finish wrote, and the two legs here write different values.
+      - name: Hand the verified stable bump to the PR job
+        if: matrix.channel == 'stable' && steps.bump.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-sources
+          path: sources.json
+          if-no-files-found: error
+          retention-days: 1
+
+  # Opening the stable PR is a separate job purely so it can be *ordered* after
+  # the dev leg. The two matrix legs are independent (`fail-fast: false`), so
+  # the stable leg can go green while dev is still building or has already
+  # failed — and the PR body's claim that dev is already running this version
+  # would then be false, with stable free to move first. That inverts the whole
+  # point of the channel. `needs:` on the matrix job is what fixes it: a matrix
+  # job reports success only when *every* leg succeeded, so this job runs
+  # exactly when both channels verified the same upstream build.
+  stable-pr:
+    needs: update
+    if: needs.update.result == 'success' && (github.event_name == 'schedule' || github.ref_name == 'main')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Always main: the matrix only selects the stable leg on a schedule
+          # or when the dispatching ref already is main.
+          ref: main
+          fetch-depth: 0
+
+      # Absent when the stable leg found nothing to bump, which is the common
+      # case — hence continue-on-error rather than a failure.
+      - name: Fetch the verified sources.json
+        id: sources
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: stable-sources
+
+      # Stated from what `dev` actually is right now rather than from what the
+      # design intends, so the PR cannot claim dev exposure it did not get.
+      - name: Describe the dev channel's state
+        id: dev
+        if: steps.sources.outcome == 'success'
+        run: |
+          set -euo pipefail
+          version="$(jq -r .version sources.json)"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+          git fetch --no-tags --force origin "+refs/heads/dev:refs/remotes/origin/dev"
+          dev_version="$(git show origin/dev:sources.json | jq -r .version)"
+          if [ "$dev_version" = "$version" ]; then
+            # shellcheck disable=SC2016  # the backticks are markdown, not a subshell
+            note='The **dev** channel is already on this version — its leg commits straight to `dev`, so it has been running against this build since the bump.'
+          else
+            note="The **dev** channel is on \`$dev_version\`, not this version — worth a look before merging, since the channels are meant to move together with dev first."
+          fi
+          echo "note=$note" >>"$GITHUB_OUTPUT"
+
       - name: Open pull request
-        if: steps.bump.outputs.changed == 'true'
+        if: steps.sources.outcome == 'success'
         uses: peter-evans/create-pull-request@v8
         with:
-          # The channel is in the branch name because both legs can land on the
-          # same upstream version on the same day, and two legs pushing one
-          # branch would race.
-          branch: update/${{ matrix.channel }}/claude-desktop-${{ steps.bump.outputs.version }}
-          base: ${{ matrix.branch }}
-          commit-message: "claude-desktop: ${{ steps.bump.outputs.version }}"
-          title: "claude-desktop: ${{ steps.bump.outputs.version }} (${{ matrix.channel }})"
+          # A fixed branch name, not one per version. create-pull-request
+          # updates the existing PR when the branch already exists, so stable
+          # has exactly one open bump PR at all times and it always carries the
+          # newest version — rather than a new PR per bump piling up behind
+          # whichever one you have not merged yet.
+          #
+          # This also keeps the sync-dev merge cheap: main lands on the same
+          # version dev already has, so sources.json is identical on both sides
+          # and merges without a conflict to resolve.
+          #
+          # Safe as a single branch only because the dev leg no longer opens a
+          # PR at all; when both legs did, one branch name for both would race.
+          branch: update/stable
+          base: main
+          commit-message: "claude-desktop: ${{ steps.dev.outputs.version }}"
+          title: "claude-desktop: ${{ steps.dev.outputs.version }} (stable)"
           delete-branch: true
           add-paths: |
             sources.json
           body: |
-            Automated bump of the **${{ matrix.channel }}** channel to
-            **${{ steps.bump.outputs.version }}**, from
+            Automated bump of the **stable** channel to
+            **${{ steps.dev.outputs.version }}**, from
             [Anthropic's APT index](https://downloads.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages).
 
-            Verified in CI before this PR was opened:
+            Verified in CI before this PR was opened, and opened only once
+            *every* channel leg of that run had finished green — so on a
+            scheduled run the dev leg has already built this same version:
 
             - the download hash matches the SHA256 published in the index
             - `nix build .#default` succeeds
             - the output has an executable wrapper, `chrome-sandbox`, and a desktop entry
             - `nix flake check` passes
+
+            ${{ steps.dev.outputs.note }}
+
+            Merging here moves stable to the same upstream build, and
+            `sync-dev` then merges main back into dev.
 
             Upstream ships no changelog for the Linux builds, so there is
             nothing to link beyond the version bump itself.
