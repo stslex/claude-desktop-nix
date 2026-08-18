@@ -189,14 +189,25 @@ jobs:
       # property of *this* workflow rather than a judgement call: update.sh
       # writes sources.json and nothing else — asserted at the landing step,
       # which stages that one path — and the trimmed QEMU's inputs are
-      # flake.lock, flake.nix and pkgs/claude-desktop-fhs.nix. A bump cannot
-      # move them, so the check could not fail here for a reason the sibling
-      # `cowork-fhs-paths-full-qemu` does not already catch against the same
-      # new rootfs. When those inputs *do* move, ci.yml builds it.
+      # flake.lock, flake.nix, pkgs/claude-desktop-fhs.nix and
+      # pkgs/cowork-fhs-paths.nix, the same four ci.yml's gate names. A bump
+      # cannot move any of them, so the check could not fail here for a reason
+      # the sibling `cowork-fhs-paths-full-qemu` does not already catch against
+      # the same new rootfs. When those inputs *do* move, ci.yml builds it.
+      #
+      # "Every check except one" is a claim about a hand-typed list, and the
+      # stable PR body this workflow writes repeats it to a reader who cannot
+      # check it. The drift guard below is what keeps it true: a check added to
+      # flake.nix and forgotten here would otherwise never run on a bump, never
+      # be reported, and never contradict the PR body that says it passed.
       - name: Run flake checks
         if: steps.bump.outputs.changed == 'true'
         run: |
           set -euo pipefail
+          .github/scripts/checks-accounted-for.sh \
+            wrapper-flags dlopen-runpath cowork-fhs-paths-full-qemu \
+            cowork-fhs-paths
+
           nix build -L \
             .#checks.x86_64-linux.wrapper-flags \
             .#checks.x86_64-linux.dlopen-runpath \

@@ -137,25 +137,18 @@ jobs:
       # renamed an attribute or broke the override — on every run, while the
       # expensive part of actually building it stays gated below.
       #
-      # Listing every check and diffing against what was built above is what
+      # Listing every check and diffing against what is accounted for is what
       # keeps the hand-written list in the previous step honest. A check added
       # to flake.nix and not added there fails here rather than silently going
-      # unrun.
+      # unrun. The comparison itself lives in a shared script because
+      # update.yml keeps the same kind of list and had no such guard at all.
       - name: Every check is either built above or deliberately gated
         run: |
           set -euo pipefail
-          all=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames \
-                | jq -r '.[]' | sort)
           # cowork-fhs-paths is the lean-QEMU one, gated into its own job.
-          accounted=$(printf '%s\n' \
+          .github/scripts/checks-accounted-for.sh \
             wrapper-flags dlopen-runpath cowork-fhs-paths-full-qemu \
-            cowork-fhs-paths | sort)
-
-          if ! diff <(echo "$all") <(echo "$accounted"); then
-            echo "::error::flake.nix's checks and this workflow's list have drifted."
-            echo "Add the new check to the build step above, or to the gated job."
-            exit 1
-          fi
+            cowork-fhs-paths
 
           # Force the gated check through evaluation without building it.
           nix eval --raw .#checks.x86_64-linux.cowork-fhs-paths.drvPath
