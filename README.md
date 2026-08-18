@@ -525,17 +525,32 @@ toolchain adds ~859 MiB to the FHS closure (~1.56 GiB over `packages.default`),
 and because wanting `npx` to resolve says nothing about wanting a hypervisor.
 
 **Verification status.** `checks.cowork-fhs-paths` proves the sandbox presents
-every path the probe searches and that the QEMU carried can create every device
-the helper asks for.
+every path the probe searches, that the QEMU carried can create every device the
+helper asks for, and that it accepts the helper's `-sandbox` argument — the one
+requirement with no `-<kind> help` listing to enumerate, and the one a trim can
+remove while every other assertion still passes.
 
 The end-to-end path through the app — gate → helper → bundle download →
-`startVM` → booted guest — has been exercised by hand and evidenced: a
-`qemu-system-x86_64 -name claude-cowork-vm` with `accel=kvm`, two live
-`anon_inode:kvm-vcpu` fds, `/dev/vhost-vsock` open, an ESTABLISHED `v_str`
-connection between host CID 2 and the guest, a running `virtiofsd`, and
-`/usr/share/OVMF/OVMF_CODE_4M.fd` — this repo's `pkgs/ovmf-fhs.nix` — loaded as
-the read-only `pflash` half. The guest reached Ubuntu 24.04 userspace and its
-systemd logged `Detected virtualization kvm`.
+`startVM` → booted guest — has been exercised by hand and evidenced, most
+recently on **1.32352.1**: a `qemu-system-x86_64 -name claude-cowork-vm` with
+`accel=kvm`, forked by `cowork-linux-helper`, holding `/dev/kvm`, two live
+`anon_inode:kvm-vcpu` fds and `/dev/vhost-vsock`; a `vhost-vsock-pci` device
+whose `guest-cid` matches the `guest connected from vm(…)` line in the helper's
+own log; a running `virtiofsd` behind a `vhost-user-fs-pci` with the
+`claudeshared` tag; `resources/smol-bin.x64.img` attached read-only. The guest
+reached Ubuntu 24.04 userspace, ran commands, and its systemd logged `Detected
+virtualization kvm`.
+
+**What booted it is no longer OVMF.** That capture shows a direct kernel boot —
+`-kernel vmlinuz -initrd initrd` out of the downloaded bundle, and not one
+`if=pflash` argument — with the helper's own log saying `direct kernel boot`. An
+earlier capture, on 1.24012.9, did boot through the `pflash` pair. So the
+firmware this repo supplies is required by the **gate**, which `access(R_OK)`s
+`OVMF_CODE_4M.fd` before any VM logic runs and closes Cowork if it is missing,
+and by the helper's conditional EFI path — not by the boot the app currently
+performs by default. `t14/fhs-boot-probe.nix` exercises that EFI path, which is
+why it is worth keeping and why a green probe says nothing about the direct
+kernel boot a real session takes.
 
 That run is reproducible via `t14/` (see `t14/README.md`), but it is a manual
 GUI test, not a check: nothing in CI or `nix flake check` re-runs it. On an

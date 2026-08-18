@@ -14,6 +14,15 @@
 # the app still cannot start a VM, the fault is in the app or the gate. If this
 # fails, the fault is in the sandbox, the firmware pair or the host — and the app
 # was never going to work regardless.
+#
+# One thing it deliberately does NOT reproduce: the boot method. This probe
+# boots through the OVMF pflash pair, and the live capture on 1.32352.1 shows
+# the helper doing a direct kernel boot instead — `-kernel` and `-initrd` out of
+# the downloaded bundle, no pflash argument at all. The pair is still what the
+# gate checks for, and still what the helper's conditional EFI path uses, so
+# proving it works is worth doing; it is simply not the path a real session
+# takes today. A green run here says the sandbox, KVM, vhost-vsock, virtiofsd
+# and the firmware pair are sound. It says nothing about direct kernel boot.
 let
   flake = builtins.getFlake (toString ../.);
   pkgs =
@@ -62,8 +71,15 @@ let
     # is one of those too — the README offers it as a pre-flight for the very
     # session the collector is watching. Without a marker to exclude, running
     # both would report this throwaway guest as a booted Cowork VM.
+    #
+    # -sandbox is copied from the helper's real argv. QEMU registers that option
+    # only when it was built with seccomp support, so a build without it dies
+    # here at argument parsing — which is the point: this probe should fail on
+    # anything that would stop the app, and silently omitting the flag would
+    # make it pass on a QEMU no Cowork VM could ever use.
     qemu-system-x86_64 \
       -name cowork-boot-probe \
+      -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny \
       -machine q35,accel=kvm \
       -cpu host -smp 2 -m 512 \
       -object memory-backend-memfd,id=mem0,size=512M,share=on \

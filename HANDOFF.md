@@ -24,23 +24,13 @@ and what has been measured by hand.
 
 ## 1. What is open
 
-### T1.4's GUI half — needs a human
+### Nothing, on the Cowork path itself
 
-The live test must be re-run on the current version. This is a rule, not
-caution: `t14/README.md` says re-run after any bump that touches Cowork's
-support probe or its VM helper, and the merge from `dev` touched both.
-`resources/cowork-linux-helper` went 3 236 024 → 3 285 176 bytes with a
-different hash, and `resources/smol-bin.x64.img` changed content at identical
-size. Neither is inspectable from packaging; only a live boot answers whether
-they still work here.
-
-It passed end to end once, on 1.24012.9 — the evidence is in `c0a7cb7`'s commit
-message, down to a guest that reached Ubuntu 24.04 userspace and ran commands,
-with `v_str` ESTAB from host CID 2. So this is a re-run, not a first attempt.
-
-The sandbox half does **not** need re-establishing; see §3. What the re-run has
-to cover is the path through the app: gate → helper → bundle download →
-`startVM`. Steps are in §2.
+T1.4 was re-run on 1.32352.1 on 2026-08-18 and passed; the evidence is in §3.
+The next re-run is due on the next bump that moves
+`resources/cowork-linux-helper` or `resources/smol-bin.x64.img`, per the rule in
+`t14/README.md`. Neither file is inspectable from packaging, so only a live boot
+answers it.
 
 ### The host prerequisite
 
@@ -111,6 +101,46 @@ nix flake check                     # four checks; compiles QEMU from source
 nix build --no-link --print-out-paths --impure --file t14/fhs-boot-probe.nix
 ```
 
+**T1.4 passed on 1.32352.1** (2026-08-18). Full argv and fd listing in
+`/tmp/cowork-t14-evidence.txt` at the time of the run; the load-bearing parts:
+
+- `qemu-system-x86_64 -name claude-cowork-vm`, **forked by
+  `cowork-linux-helper`** — which is what distinguishes it from any other QEMU
+  on the host, and from the boot probe;
+- `-device vhost-vsock-pci,guest-cid=208399576`, and the helper's own log
+  showing `guest connected from vm(208399576)` → `guest ready` on that same
+  CID;
+- fds on `/dev/kvm`, `kvm-vcpu:0`, `kvm-vcpu:1`, `/dev/vhost-vsock`;
+- `virtiofsd --shared-dir / --sandbox none` behind a `vhost-user-fs-pci` tagged
+  `claudeshared`; `smol-bin.x64.img` attached read-only;
+- `[VM:start] Startup complete, total time: 38726ms`, and the guest answered
+  `uname -a` / `cat /etc/os-release` as Ubuntu 24.04.4, kernel 6.18.5.
+
+Two things that capture settled, neither of which packaging could have shown:
+
+- **The helper asks QEMU for its own seccomp sandbox** —
+  `-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny`,
+  the first option after `-name`. Nothing asserted it. A QEMU built without
+  seccomp exits 1 at argument parsing while passing the gate and every other
+  assertion, so this is now `coworkQemuNeeds.sandbox` and is exercised by
+  invocation rather than by grepping a listing, because `-sandbox` has no
+  listing. Proven able to fail: with a bogus value the check reports
+  `Parameter 'enable' expects 'on' or 'off'` and the build stops.
+- **The boot was a direct kernel boot**, `-kernel` + `-initrd` from the
+  downloaded bundle, with zero `pflash` arguments. The 1.24012.9 run booted
+  through OVMF. So the firmware pair is required by the gate and by the
+  helper's conditional EFI path, not by the boot the app performs by default —
+  corrected in `README.md` § Cowork and in the boot probe's header, both of
+  which had presented OVMF as what boots the guest.
+
+The guest's kernel string is `6.18.5-fc-v20`, and the `-fc-` suffix reads like
+Firecracker. It is not evidence of anything: the same image is shipped for both,
+and the Cowork agent itself concluded from it that it was running in the cloud,
+while the local QEMU it was running under was visible in `ps` the whole time.
+The process parent and the matching vsock CID are what settle it. A cloud
+session had in fact been refused twenty seconds earlier —
+`startRemoteCoworkSession: 403` — which is why the local VM was used at all.
+
 What is worth recording because re-deriving it is expensive or impossible:
 
 - **The boot probe passes 3/3 against the trimmed QEMU** — the one the package
@@ -135,9 +165,16 @@ What is worth recording because re-deriving it is expensive or impossible:
   carries `-name cowork-boot-probe` and the collector declines it; both
   behaviours were re-measured after the fix.
 
-What is **not** established on 1.32352.1: the end-to-end path through the app
-itself. It was asserted on 1.24012.9 and nowhere since, and the two binaries
-that carry it both changed. Hence §1.
+A trap the re-run exposed, now fixed in `t14-run.sh`: redirecting
+`XDG_CONFIG_HOME` moves the whole desktop-integration context, not just the
+app's profile, so `xdg-open` inside the sandbox could not find the host's
+browser and fell back to launching a different one — with the throwaway XDG
+dirs, i.e. an empty browser profile, in which an OAuth sign-in can never
+complete. Four attempts failed before this was understood, and nothing in either
+log said why. The script now resolves the host's browser to an absolute path and
+seeds the throwaway `mimeapps.list` with it. Naming the host's `.desktop` file
+is not enough: this host's `zen.desktop` carries a bare `Exec=zen`, and PATH
+inside the sandbox is the sandbox's own.
 
 ## 4. Traps on this host
 
