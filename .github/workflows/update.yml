@@ -176,11 +176,36 @@ jobs:
           echo
           test "$(nix eval --raw .#claude-desktop-dev.passthru.channel)" = dev
 
+      # Every check except the trimmed-QEMU one, named rather than run through
+      # `nix flake check` — which has no way to skip a single check.
+      #
+      # The one left out is `cowork-fhs-paths`, which asserts against
+      # `qemu.override { hostCpuOnly = true; … }`. An override is a derivation
+      # no binary cache carries, so it compiles QEMU from source on every run
+      # that needs it. Running it here would put a source build of QEMU in the
+      # path of every daily bump.
+      #
+      # Leaving it out costs this run nothing in coverage, and that is a
+      # property of *this* workflow rather than a judgement call: update.sh
+      # writes sources.json and nothing else — asserted at the landing step,
+      # which stages that one path — and the trimmed QEMU's inputs are
+      # flake.lock, flake.nix and pkgs/claude-desktop-fhs.nix. A bump cannot
+      # move them, so the check could not fail here for a reason the sibling
+      # `cowork-fhs-paths-full-qemu` does not already catch against the same
+      # new rootfs. When those inputs *do* move, ci.yml builds it.
       - name: Run flake checks
         if: steps.bump.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          nix flake check -L
+          nix build -L \
+            .#checks.x86_64-linux.wrapper-flags \
+            .#checks.x86_64-linux.dlopen-runpath \
+            .#checks.x86_64-linux.cowork-fhs-paths-full-qemu
+
+          # Not built, but still forced through evaluation, so a rename or a
+          # broken override fails the bump instead of waiting for ci.yml.
+          nix eval --raw .#checks.x86_64-linux.cowork-fhs-paths.drvPath
+          echo
 
       # Both landing steps sit below every guard, so the contract at the top of
       # this file holds for either path: a broken build leaves the branch
@@ -347,7 +372,10 @@ jobs:
             - the download hash matches the SHA256 published in the index
             - `nix build .#default` succeeds
             - the output has an executable wrapper, `chrome-sandbox`, and a desktop entry
-            - `nix flake check` passes
+            - every flake check passes except `cowork-fhs-paths`, which asserts
+              against a source-built trimmed QEMU and cannot be affected by a
+              bump — it is evaluated here and built by `ci.yml` when its own
+              inputs move
 
             ${{ steps.dev.outputs.note }}
 

@@ -10,10 +10,12 @@
 # was never going to work regardless.
 let
   flake = builtins.getFlake (toString ../.);
-  pkgs = (import flake.inputs.nixpkgs {
-    system = "x86_64-linux";
-    config.allowUnfree = true;
-  }).extend flake.overlays.default;
+  pkgs =
+    (import flake.inputs.nixpkgs {
+      system = "x86_64-linux";
+      config.allowUnfree = true;
+    }).extend
+      flake.overlays.default;
 
   ovmf-fhs = pkgs.callPackage ../pkgs/ovmf-fhs.nix { };
 
