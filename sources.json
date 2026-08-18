@@ -1,10 +1,10 @@
 {
-  "version": "1.26832.0",
+  "version": "1.32352.1",
   "systems": {
     "x86_64-linux": {
       "arch": "amd64",
-      "url": "https://downloads.claude.ai/claude-desktop/apt/stable/pool/main/c/claude-desktop/claude-desktop_1.26832.0_amd64.deb",
-      "hash": "sha256-K8bw1BCbtDswdpbhEo31P785PvmPlHp4aZSGQkUCRdc="
+      "url": "https://downloads.claude.ai/claude-desktop/apt/stable/pool/main/c/claude-desktop/claude-desktop_1.32352.1_amd64.deb",
+      "hash": "sha256-nQDE6obQNwYeHKHxcJ+TDsSk13N9h7L2i4e8PofjgYY="
     }
   }
 }
