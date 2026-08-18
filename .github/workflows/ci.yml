@@ -18,12 +18,19 @@ name: ci
 # `lean-qemu` job for exactly which inputs those are and why the list is
 # complete.
 on:
+  # Only the long-lived branches on push. Every other branch is covered by its
+  # pull request instead, and covering it twice is not free: the two events
+  # produce different `github.ref` values, so no concurrency group can collapse
+  # them, and each run carries its own copy of the gated QEMU source build.
+  # Observed on this workflow's own first push — two runs, one tree.
+  #
+  # The cost of the rule is that a branch with no PR open gets no CI. That is
+  # the normal trade, and it is still strictly more than the nothing this
+  # repository had before.
   push:
-    # The automation's own branch is excluded: create-pull-request force-pushes
-    # it, and the pull_request event below already covers the PR it opens.
-    # Without this every stable bump would run this workflow twice on one tree.
-    branches-ignore:
-      - update/**
+    branches:
+      - main
+      - dev
   pull_request:
 
 permissions:
@@ -33,7 +40,9 @@ permissions:
 # workflows that *write* to branches, cancelling in progress is correct here —
 # there is no landing step whose loss would strand a verified result.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Keyed on the PR number where there is one, so successive pushes to a branch
+  # supersede each other's PR run rather than piling up several QEMU builds.
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
