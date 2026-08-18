@@ -11,8 +11,16 @@ name: ci
 # asserts against the *trimmed* QEMU — `qemu.override { hostCpuOnly = true; … }`
 # — and an override is a different derivation from `qemu_kvm`, so no binary
 # cache carries it and every run that needs it compiles QEMU from source. On
-# this repository's hardware that is ~18 minutes; on a 4-core runner with no
-# cache configured (see update.yml on why there is none) it is far worse.
+# this repository's hardware that is ~18 minutes. On a GitHub-hosted
+# ubuntu-24.04 runner with no cache configured (see update.yml on why there is
+# none) it is 10m05s of QEMU plus ~1m30s of setup, for a job of 11m40s —
+# measured on run 32151939933, the first one that ever finished it.
+#
+# An earlier version of this comment guessed "far worse" than the local 18
+# minutes. It was wrong, and wrong in the direction that flatters the gate. The
+# gate still earns its complexity at ~12 minutes a run; it should just be
+# justified by the number that was observed rather than the one that was
+# assumed.
 #
 # So it runs when its inputs move and not otherwise. See the gate in the
 # `lean-qemu` job for exactly which inputs those are and why the list is
@@ -36,13 +44,42 @@ on:
 permissions:
   contents: read
 
-# Superseding a push makes the older run's answer worthless, so unlike the
-# workflows that *write* to branches, cancelling in progress is correct here —
-# there is no landing step whose loss would strand a verified result.
+# Cancelling a run in progress is correct for a pull request and wrong for a
+# push, and the difference has nothing to do with cost. It is about what the
+# `lean-qemu` gate below diffs against.
+#
+# A pull request's gate diffs HEAD against `origin/<base_ref>` — a fixed point.
+# Cancel that run and the next one re-derives the same cumulative answer, so
+# nothing is lost by superseding it.
+#
+# A push's gate diffs against `github.event.before`, the tip immediately before
+# *that* push. Cancel that run and the coverage is not deferred, it is gone:
+# the following push diffs from the commit whose check never ran, sees none of
+# the four tracked paths move, and skips. From then on the unverified change
+# sits in the baseline of every future diff and can never resurface as
+# "changed" again.
+#
+# That is the ordinary daily case here rather than a contrived race. `dev`
+# takes two unattended pushes ten minutes apart every day — sync-dev.yml at
+# 05:07, update.yml at 05:17 — and the job they would cancel runs ~12 minutes.
+# A packaging change carried onto `dev` by the 05:07 sync would have its only
+# trimmed-QEMU build killed by the 05:17 bump, which touches sources.json alone
+# and therefore skips the check itself.
+#
+# So group pushes per commit — which is to say, do not group them — and keep
+# the supersession where it is safe.
+#
+# What this does not fix: a push run that fails, or that someone cancels by
+# hand, leaves the same hole, because the hole is a property of an incremental
+# base rather than of cancellation. The difference is that those are visible on
+# the branch as a red or grey run, instead of being silently absorbed by the
+# next push's green one.
 concurrency:
   # Keyed on the PR number where there is one, so successive pushes to a branch
   # supersede each other's PR run rather than piling up several QEMU builds.
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Keyed on the commit where there is not, so no push can cancel another
+  # push's answer.
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:
