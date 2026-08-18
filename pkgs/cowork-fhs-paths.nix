@@ -116,9 +116,30 @@ runCommand
 
     check_group machine ${lib.escapeShellArgs coworkQemuNeeds.machines}
     check_group accel   ${lib.escapeShellArgs coworkQemuNeeds.accels}
+    check_group cpu     ${lib.escapeShellArgs coworkQemuNeeds.cpus}
     check_group device  ${lib.escapeShellArgs coworkQemuNeeds.devices}
     check_group object  ${lib.escapeShellArgs coworkQemuNeeds.objects}
     check_group netdev  ${lib.escapeShellArgs coworkQemuNeeds.netdevs}
+
+    # --- the one option with no listing to grep -------------------------------
+    #
+    # `-sandbox` is not a registry, so it is exercised rather than enumerated.
+    # QEMU registers the option only when it was built with seccomp support;
+    # without it the process dies at argument parsing with "-sandbox support is
+    # not enabled in this QEMU binary", long before any device is created — a
+    # failure the five listings above cannot see, because every device they ask
+    # about is still present in such a build.
+    #
+    # The order is load-bearing. QEMU handles argv left to right and `-version`
+    # exits as soon as it is reached, so `-sandbox … -version` validates and
+    # `-version -sandbox …` does not. Measured on the trimmed build: with the
+    # real value it exits 0; with a deliberately bogus one it exits 1 and says
+    # "Parameter 'enable' expects 'on' or 'off'"; with the arguments reversed it
+    # exits 0 even for the bogus value. An assertion that passes for a value
+    # QEMU should reject is not an assertion.
+    sandbox_out=$("$qemu" -sandbox ${lib.escapeShellArg coworkQemuNeeds.sandbox} -version 2>&1) \
+      || fail "this qemu rejects the helper's -sandbox argument: $sandbox_out"
+    echo "  sandbox ${coworkQemuNeeds.sandbox}: ok"
 
     touch $out
   ''

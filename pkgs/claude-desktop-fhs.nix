@@ -238,8 +238,11 @@ buildFHSEnv {
       };
     };
 
-    # What `resources/cowork-linux-helper` asks QEMU for, read out of the
-    # helper's own argv fragments rather than guessed from the feature name.
+    # What `resources/cowork-linux-helper` asks QEMU for. Originally read out of
+    # the helper's own argv fragments rather than guessed from the feature name;
+    # since 2026-08-18 also checked against a real Cowork VM booted on this
+    # host, whose full argv T1.4 captured (t14/README.md). Everything below
+    # appears in that capture.
     #
     # The gate checks that a `qemu-system-x86_64` exists and stops there — it
     # inspects no capability. So a QEMU that satisfies the gate and then cannot
@@ -262,6 +265,25 @@ buildFHSEnv {
       ];
       objects = [ "memory-backend-memfd" ]; # share=on, required by vhost-user-fs
       netdevs = [ "user" ]; # guest networking; libslirp
+      cpus = [ "host" ]; # -cpu host; only meaningful together with accels
+
+      # Not a `-<kind> help` registry entry like the six lists above. `-sandbox`
+      # is a bare global option with no enumerable listing at all — `-sandbox
+      # help` answers "Parameter 'enable' expects 'on' or 'off'" — so the check
+      # exercises it by invoking it rather than by grepping a listing.
+      #
+      # It is worth watching precisely because nothing here pins it. QEMU only
+      # registers the option when `system/qemu-seccomp.c` was compiled in, which
+      # nixpkgs gates on `seccompSupport`; `leanQemu` above turns off eighteen
+      # `*Support` flags and does not touch that one, so the current pass is
+      # inherited from a nixpkgs default rather than chosen. Turn it off — one
+      # more line in a list that has already grown past its stated scope — and
+      # QEMU exits 1 at argument parsing, before a single device is created,
+      # while the gate and every other assertion here still pass.
+      #
+      # Verbatim from the live helper argv, where it is the first option after
+      # `-name claude-cowork-vm`.
+      sandbox = "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny";
     };
   }
   // lib.optionalAttrs cowork {
