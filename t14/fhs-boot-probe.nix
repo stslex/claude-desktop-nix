@@ -1,8 +1,14 @@
 # Diagnostic only. Not part of the repository, never referenced by the flake.
 #
-# Boots a real QEMU inside the *same* bubblewrap composition claude-desktop-cowork
-# uses, with the same OVMF pair, the same vhost-vsock device and a real virtiofsd,
-# and then kills it. Nothing about Claude Desktop is involved.
+# Boots a real QEMU inside a bubblewrap composition built from the same pieces
+# claude-desktop-cowork uses — the same trimmed QEMU it actually ships (via
+# `passthru.qemu`), the same OVMF pair, the same vhost-vsock device and a real
+# virtiofsd — and then kills it. Nothing about Claude Desktop is involved.
+#
+# "The same pieces" rather than "the same sandbox": targetPkgs here is written
+# out by hand, so this is a reconstruction of that environment and not the
+# environment itself. Every component that the guest's ability to boot depends
+# on is the identical derivation; the list around them is not.
 #
 # The point is to split T1.4's single opaque outcome in two. If this passes and
 # the app still cannot start a VM, the fault is in the app or the gate. If this
@@ -51,7 +57,13 @@ let
     # A guest-cid nobody else is using. 3 is reserved for the host-facing side.
     cid=$(( (RANDOM % 60000) + 2000 ))
 
+    # -name is not decoration. t14-evidence.sh finds the Cowork VM by looking
+    # for a qemu-system-x86_64 carrying a vhost-vsock-pci device, and this probe
+    # is one of those too — the README offers it as a pre-flight for the very
+    # session the collector is watching. Without a marker to exclude, running
+    # both would report this throwaway guest as a booted Cowork VM.
     qemu-system-x86_64 \
+      -name cowork-boot-probe \
       -machine q35,accel=kvm \
       -cpu host -smp 2 -m 512 \
       -object memory-backend-memfd,id=mem0,size=512M,share=on \
@@ -108,7 +120,15 @@ pkgs.buildFHSEnv {
     pkgs.gnugrep
     pkgs.gnused
     pkgs.which
-    pkgs.qemu_kvm
+    # The QEMU claude-desktop-cowork actually carries, not `pkgs.qemu_kvm`.
+    # flake.nix pins `leanQemu = true`, so the shipped binary is
+    # `qemu.override { hostCpuOnly = true; … }` — a different derivation with a
+    # different feature set. Probing the cached full QEMU would answer a
+    # question nobody asked: a trimmed build that has lost a device the helper
+    # needs would still show 3/3 here while the app it is supposed to vouch for
+    # cannot boot a guest at all, which is the one failure this file exists to
+    # localise. `passthru.qemu` is exported for exactly this.
+    pkgs.claude-desktop-cowork.qemu
     pkgs.virtiofsd
     ovmf-fhs
   ];

@@ -40,7 +40,7 @@ running Claude Desktop. That cost four false readings in one session. Matching
 | --- | --- |
 | `t14-run.sh` | Builds `.#claude-desktop-cowork` and launches it against a throwaway profile. Refuses to run alongside another Claude Desktop or an orphaned helper. |
 | `t14-evidence.sh` | Watches for a Cowork VM for up to 15 minutes, then writes a report proving it either did or did not boot. Safe to start before or after the app. |
-| `fhs-boot-probe.nix` | Optional. Boots a QEMU in the *same* sandbox composition with no Claude Desktop involved, to tell a sandbox failure from an app failure. |
+| `fhs-boot-probe.nix` | Optional. Boots a QEMU from the same pieces the sandbox carries — the trimmed QEMU, the OVMF pair, a real virtiofsd — with no Claude Desktop involved, to tell a sandbox failure from an app failure. |
 
 ## Running it
 
@@ -66,6 +66,17 @@ live `virtiofsd` behind it. The collector discriminates on `vhost-vsock-pci`
 specifically so that an Android-emulator `qemu-system-x86_64`, which never uses
 one, is not reported as a pass.
 
+That discriminator does not separate the collector from `fhs-boot-probe.nix`,
+though, which boots a QEMU with a `vhost-vsock-pci` device of its own — and this
+file recommends running it for the same session. Measured: with the probe's
+guest alive, the original matcher returned its pid and would have written
+`VM FOUND` for a VM that was never Cowork's. The probe therefore names itself
+(`-name cowork-boot-probe`) and the collector declines any process carrying that
+marker, so the two are safe to run together. The report also prints the parent
+of whichever QEMU it found: a real Cowork VM is forked by
+`cowork-linux-helper`, and anything else named there means the argv matched for
+the wrong reason.
+
 ## Isolation and cleanup
 
 `t14-run.sh` redirects `XDG_{CONFIG,CACHE,DATA,STATE}_HOME` under
@@ -86,7 +97,14 @@ rm -rf /tmp/cowork-t14      # or "$COWORK_TEST_ROOT"
 Quit the app first — deleting the profile under a running VM leaves QEMU writing
 into unlinked files.
 
-The boot probe is impure and evaluates the flake from this checkout:
+The boot probe carries the same trimmed QEMU `claude-desktop-cowork` ships —
+`flake.nix` pins `leanQemu = true`, and the probe reads it back off
+`passthru.qemu` rather than reaching for `pkgs.qemu_kvm`. Booting the cached
+full QEMU would have answered a question nobody asked: a trim that dropped a
+device the helper needs would still show 3/3 while the app could not start a VM
+at all, which is the one confusion this probe exists to prevent.
+
+It is impure and evaluates the flake from this checkout:
 
 ```bash
 nix build --no-link --print-out-paths --impure --file t14/fhs-boot-probe.nix

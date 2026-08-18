@@ -45,6 +45,13 @@ find_qemu() {
     # would otherwise print "No such file or directory" into the report.
     c=$(tr '\0' ' ' 2>/dev/null < "$d/cmdline") || continue
     case "$c" in
+      # t14/fhs-boot-probe.nix boots a qemu with a vhost-vsock device of its
+      # own, and t14/README.md offers it as a pre-flight for this very session.
+      # So the discriminator that keeps the Android emulator out does not keep
+      # the probe out: run both and this collector would report a throwaway
+      # 10-second guest as a booted Cowork VM. The probe marks itself with
+      # `-name cowork-boot-probe` precisely so this loop can decline it.
+      *cowork-boot-probe*) continue ;;
       *qemu-system-x86_64*vhost-vsock-pci*) echo "$pid"; return 0 ;;
     esac
   done
@@ -88,6 +95,12 @@ if [ -n "$qemu" ]; then
   echo
   echo "--- 1. the qemu process and its argv ---"
   dump_proc "$qemu" "qemu-system-x86_64"
+  # Corroboration, not a gate: the argv above is the evidence, and this says
+  # who produced it. A Cowork VM is forked by cowork-linux-helper. Anything
+  # else named here — a shell, an init, this script — means the qemu that was
+  # found is not the one the test is about, however well its argv matched.
+  ppid=$(awk '/^PPid:/{print $2}' "/proc/$qemu/status" 2>/dev/null)
+  echo "  parent:  pid ${ppid:-?} -> $(readlink "/proc/${ppid:-0}/exe" 2>/dev/null || echo '(exited or not ours to read)')"
   echo
   echo "--- 2. open fds: KVM vcpus and the vsock device ---"
   ls -l "/proc/$qemu/fd" 2>/dev/null | grep -E 'kvm|vhost-vsock|vhost-net' | sed 's/^/    /'
