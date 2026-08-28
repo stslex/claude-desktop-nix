@@ -49,6 +49,31 @@
         claude-desktop-dev-fhs = final.callPackage ./pkgs/claude-desktop-fhs.nix {
           claude-desktop = final.claude-desktop-dev;
         };
+
+        # Cowork-enabled variant. Same application and same FHS sandbox as
+        # claude-desktop-fhs, plus QEMU, OVMF and virtiofsd at the paths the
+        # app's Linux virtualization probe searches.
+        #
+        # A separate output rather than a change to claude-desktop-fhs because
+        # the VM toolchain roughly doubles that variant's marginal closure, and
+        # the two audiences do not overlap: wanting `npx` to resolve says
+        # nothing about wanting a hypervisor. Nothing here alters
+        # claude-desktop or claude-desktop-fhs, which build to the same store
+        # paths they did before this existed.
+        claude-desktop-cowork = final.callPackage ./pkgs/claude-desktop-fhs.nix {
+          cowork = true;
+          ovmf-fhs = final.callPackage ./pkgs/ovmf-fhs.nix { };
+
+          # The trimmed QEMU is the default here, not an opt-in. It halves the
+          # marginal closure, and everything the helper's argv names survives
+          # the trim — asserted by checks.cowork-fhs-paths against this build,
+          # and exercised end to end by a booted guest (see t14/). The cost is
+          # a source build no cache carries; the untrimmed one is one override
+          # away:
+          #
+          #     claude-desktop-cowork.override { leanQemu = false; }
+          leanQemu = true;
+        };
       };
 
       packages = forAllSystems (
@@ -60,6 +85,7 @@
           inherit (pkgs)
             claude-desktop
             claude-desktop-fhs
+            claude-desktop-cowork
             claude-desktop-dev
             claude-desktop-dev-fhs
             ;
@@ -121,6 +147,21 @@
           # documented at the top of the file itself.
           dlopen-runpath = pkgs.callPackage ./pkgs/dlopen-runpath.nix {
             inherit claude-desktop;
+          };
+
+          # Both Cowork variants. The default is now the trimmed QEMU — the
+          # build with a real reason to fail these assertions — so the base
+          # check covers the risk rather than the safe case. The second leg
+          # overrides back to the cached `qemu_kvm`: it is the supported
+          # escape hatch, and an escape hatch nothing evaluates is one that
+          # breaks unnoticed and is discovered by whoever reaches for it.
+          cowork-fhs-paths = pkgs.callPackage ./pkgs/cowork-fhs-paths.nix {
+            claude-desktop-cowork = self.packages.${system}.claude-desktop-cowork;
+          };
+          cowork-fhs-paths-full-qemu = pkgs.callPackage ./pkgs/cowork-fhs-paths.nix {
+            claude-desktop-cowork = self.packages.${system}.claude-desktop-cowork.override {
+              leanQemu = false;
+            };
           };
         }
       );

@@ -1,0 +1,249 @@
+name: ci
+
+# Verifies a tree on push and on pull request.
+#
+# Until this file existed the repository had no push/PR CI at all: the only
+# thing that ever built anything was update.yml, on a schedule. A commit was
+# therefore unverified until the next upstream bump happened to build it, and a
+# bad commit was attributed to whichever bump first tripped over it.
+#
+# The split into two jobs is about one derivation. `checks.cowork-fhs-paths`
+# asserts against the *trimmed* QEMU — `qemu.override { hostCpuOnly = true; … }`
+# — and an override is a different derivation from `qemu_kvm`, so no binary
+# cache carries it and every run that needs it compiles QEMU from source. On
+# this repository's hardware that is ~18 minutes. On a GitHub-hosted
+# ubuntu-24.04 runner with no cache configured (see update.yml on why there is
+# none) it is 10m05s of QEMU plus ~1m30s of setup, for a job of 11m40s —
+# measured on run 32151939933, the first one that ever finished it.
+#
+# An earlier version of this comment guessed "far worse" than the local 18
+# minutes. It was wrong, and wrong in the direction that flatters the gate. The
+# gate still earns its complexity at ~12 minutes a run; it should just be
+# justified by the number that was observed rather than the one that was
+# assumed.
+#
+# So it runs when its inputs move and not otherwise. See the gate in the
+# `lean-qemu` job for exactly which inputs those are and why the list is
+# complete.
+on:
+  # Only the long-lived branches on push. Every other branch is covered by its
+  # pull request instead, and covering it twice is not free: the two events
+  # produce different `github.ref` values, so no concurrency group can collapse
+  # them, and each run carries its own copy of the gated QEMU source build.
+  # Observed on this workflow's own first push — two runs, one tree.
+  #
+  # The cost of the rule is that a branch with no PR open gets no CI. That is
+  # the normal trade, and it is still strictly more than the nothing this
+  # repository had before.
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+
+permissions:
+  contents: read
+
+# Cancelling a run in progress is correct for a pull request and wrong for a
+# push, and the difference has nothing to do with cost. It is about what the
+# `lean-qemu` gate below diffs against.
+#
+# A pull request's gate diffs HEAD against `origin/<base_ref>` — a fixed point.
+# Cancel that run and the next one re-derives the same cumulative answer, so
+# nothing is lost by superseding it.
+#
+# A push's gate diffs against `github.event.before`, the tip immediately before
+# *that* push. Cancel that run and the coverage is not deferred, it is gone:
+# the following push diffs from the commit whose check never ran, sees none of
+# the four tracked paths move, and skips. From then on the unverified change
+# sits in the baseline of every future diff and can never resurface as
+# "changed" again.
+#
+# That is the ordinary daily case here rather than a contrived race. `dev`
+# takes two unattended pushes ten minutes apart every day — sync-dev.yml at
+# 05:07, update.yml at 05:17 — and the job they would cancel runs ~12 minutes.
+# A packaging change carried onto `dev` by the 05:07 sync would have its only
+# trimmed-QEMU build killed by the 05:17 bump, which touches sources.json alone
+# and therefore skips the check itself.
+#
+# So group pushes per commit — which is to say, do not group them — and keep
+# the supersession where it is safe.
+#
+# What this does not fix: a push run that fails, or that someone cancels by
+# hand, leaves the same hole, because the hole is a property of an incremental
+# base rather than of cancellation. The difference is that those are visible on
+# the branch as a red or grey run, instead of being silently absorbed by the
+# next push's green one.
+concurrency:
+  # Keyed on the PR number where there is one, so successive pushes to a branch
+  # supersede each other's PR run rather than piling up several QEMU builds.
+  # Keyed on the commit where there is not, so no push can cancel another
+  # push's answer.
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  # Everything a cache can serve. Kept to one job because these share the
+  # claude-desktop build: splitting them would re-download and re-unpack the
+  # ~160 MB .deb once per job.
+  checks:
+    name: build and cheap checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      # Same reasoning as update.yml: the .deb is ~160 MB, the unpacked
+      # derivation ~500 MB, and the FHS rootfs adds a second copy of the
+      # closure on top of that.
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Formatting
+        run: |
+          set -euo pipefail
+          nix fmt -- --check .
+
+      # Named explicitly rather than run via `nix flake check`, which offers no
+      # way to skip a single check — that is the whole reason the lean job below
+      # can exist. Keep this list in sync with flake.nix's `checks`; the
+      # evaluation step below is what catches an addition that was forgotten
+      # here.
+      - name: Build packages and checks
+        run: |
+          set -euo pipefail
+          nix build -L \
+            .#default \
+            .#claude-desktop-fhs \
+            .#checks.x86_64-linux.wrapper-flags \
+            .#checks.x86_64-linux.dlopen-runpath \
+            .#checks.x86_64-linux.cowork-fhs-paths-full-qemu
+
+          # Prove the output is usable, not merely buildable — a bad
+          # autoPatchelf run still produces a store path.
+          test -x ./result/bin/claude-desktop
+          test -f ./result/lib/claude-desktop/chrome-sandbox
+          test -f ./result/share/applications/com.anthropic.Claude.desktop
+
+      # Evaluating the skipped check costs nothing and is not the same as
+      # trusting it: it proves the lean path still *evaluates* — that nobody
+      # renamed an attribute or broke the override — on every run, while the
+      # expensive part of actually building it stays gated below.
+      #
+      # Listing every check and diffing against what is accounted for is what
+      # keeps the hand-written list in the previous step honest. A check added
+      # to flake.nix and not added there fails here rather than silently going
+      # unrun. The comparison itself lives in a shared script because
+      # update.yml keeps the same kind of list and had no such guard at all.
+      - name: Every check is either built above or deliberately gated
+        run: |
+          set -euo pipefail
+          # cowork-fhs-paths is the lean-QEMU one, gated into its own job.
+          .github/scripts/checks-accounted-for.sh \
+            wrapper-flags dlopen-runpath cowork-fhs-paths-full-qemu \
+            cowork-fhs-paths
+
+          # Force the gated check through evaluation without building it.
+          nix eval --raw .#checks.x86_64-linux.cowork-fhs-paths.drvPath
+          echo
+
+      - name: Dev channel outputs evaluate
+        run: |
+          set -euo pipefail
+          nix eval --raw .#claude-desktop-dev.name
+          echo
+          test "$(nix eval --raw .#claude-desktop-dev.passthru.channel)" = dev
+
+  # The trimmed-QEMU assertion. Its own job so that the common push pays
+  # nothing for it, and so that when it does run its ~18+ minutes are visible
+  # as their own line in the UI rather than hidden inside a step.
+  lean-qemu:
+    name: cowork-fhs-paths (trimmed qemu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The gate diffs against a base commit, which a shallow clone may not
+          # contain.
+          fetch-depth: 0
+
+      # Which inputs can change what this check tests:
+      #
+      #   flake.lock                   nixpkgs moves -> a different QEMU source
+      #                                tree, different defaults, different
+      #                                meaning for every override below.
+      #   pkgs/claude-desktop-fhs.nix  holds the override list itself. Trimming
+      #                                one feature too many is the exact failure
+      #                                this check exists to catch, so gating on
+      #                                flake.lock alone — as originally sketched
+      #                                — would skip the check precisely when it
+      #                                matters most.
+      #   pkgs/cowork-fhs-paths.nix    the assertions.
+      #   flake.nix                    wires the check and pins leanQemu.
+      #
+      # sources.json is deliberately absent: an upstream bump changes the app
+      # payload, not the QEMU, and cowork-fhs-paths-full-qemu already re-runs
+      # every path assertion against the new rootfs on the cached QEMU.
+      - name: Decide whether the trimmed QEMU needs rebuilding
+        id: gate
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            # checkout above is unshallow, so this only has to make sure the
+            # base branch itself is present as a remote-tracking ref.
+            git fetch --no-tags --force origin \
+              "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+            base="origin/${{ github.base_ref }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+
+          # A new branch reports an all-zero "before", and a force-push can name
+          # a commit that no longer exists. Both mean "cannot tell" — and the
+          # safe answer to that is to run the check, never to skip it.
+          if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+            echo "cannot resolve base '$base' — running the check rather than guessing"
+            echo "run=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed=$(git diff --name-only "$base" HEAD -- \
+            flake.lock flake.nix pkgs/claude-desktop-fhs.nix pkgs/cowork-fhs-paths.nix)
+
+          if [ -n "$changed" ]; then
+            echo "inputs to the trimmed QEMU changed:"
+            printf '  %s\n' $changed
+            echo "run=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "no input to the trimmed QEMU changed since $base — skipping the source build."
+            echo "run=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - uses: DeterminateSystems/nix-installer-action@main
+        if: steps.gate.outputs.run == 'true'
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      # A QEMU source build needs materially more room than the app alone.
+      - name: Free disk space
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
+
+      - name: Build the check against the trimmed QEMU
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          nix build -L .#checks.x86_64-linux.cowork-fhs-paths

@@ -18,10 +18,12 @@ $ nix run github:<you>/claude-desktop-nix
 | --- | --- |
 | `packages.default` / `packages.claude-desktop` | The app. Use this one. |
 | `packages.claude-desktop-fhs` | Same app inside a `buildFHSEnv` that provides `npx`, `uvx`, `docker`, `git`, `python3` at conventional FHS paths, so published MCP server configs work unmodified. |
+| `packages.claude-desktop-cowork` | Same FHS sandbox, plus QEMU, OVMF and virtiofsd at the paths Cowork's VM probe searches. See [Cowork](#cowork). |
 | `packages.claude-desktop-dev` / `-dev-fhs` | The same build from the **dev** packaging channel — see [Channels](#channels). |
-| `overlays.default` | Adds `claude-desktop`, `claude-desktop-fhs` and their `-dev` counterparts to a nixpkgs instance. |
+| `overlays.default` | Adds `claude-desktop`, `claude-desktop-fhs`, `claude-desktop-cowork` and the `-dev` counterparts to a nixpkgs instance. |
 | `checks.wrapper-flags` | Asserts the wrapper keeps its flags, never gains `--no-sandbox`, ships `chrome-sandbox`, and has a valid desktop entry with rewritten `Exec=` lines. |
 | `checks.dlopen-runpath` | Scans every shipped ELF for soname strings and asserts that each library this package provides resolves from the RUNPATH of every object naming it, that nothing on the lists has stopped being named, and that nothing *new* is named without being classified. See [Dependency provenance](#dependency-provenance). |
+| `checks.cowork-fhs-paths` / `-full-qemu` | Asserts the Cowork sandbox presents every path the app's VM probe searches, that the OVMF code file has its matching vars file, and that the QEMU carried can actually create the devices the helper asks for. The unsuffixed one runs against the trimmed QEMU the package actually ships; `-full-qemu` runs the same assertions against the cached `qemu_kvm` that `leanQemu = false` selects. |
 
 ### NixOS
 
@@ -290,8 +292,15 @@ advertises**, and rewrites `sources.json`. A divergence is a hard failure.
 
 `.github/workflows/update.yml` runs it daily and on demand, one matrix leg per
 channel. Nothing lands until `nix build .#default`, the dlopen-RUNPATH guard
-and `nix flake check` have all passed on the new version — a version that bumps
+and every flake check have all passed on the new version — a version that bumps
 cleanly but builds broken fails the workflow and leaves the branch untouched.
+
+The checks are named one by one rather than run through `nix flake check`,
+which offers no way to skip a single check, and skipping exactly one of them —
+`cowork-fhs-paths`, which compiles QEMU from source — is the whole point. See
+[Verification](#verification) for why leaving it out costs a bump nothing, and
+for the guard that stops the hand-written list from quietly falling behind
+`flake.nix`.
 
 Where a verified bump lands differs by channel:
 
@@ -339,7 +348,7 @@ one would let a scheduled bump evict a sync that was waiting to carry a fresh
 `main` commit over. They resolve the race at the push instead: a rejected push
 means the branch moved, so `sync-dev` rebuilds its merge from the new tip and
 the updater re-runs `update.sh` against it. The updater re-derives rather than
-rebases because `sources.json` is nine lines long — git's line-based merge
+rebases because `sources.json` is ten lines long — git's line-based merge
 calls almost any two-sided edit a conflict, including edits that do not overlap
 semantically at all. Re-deriving reapplies the bump fields, keeps whatever else
 landed, and refuses to land anything but the version this run actually built.
@@ -349,6 +358,54 @@ One repository setting is load-bearing for the stable leg: **Settings → Action
 pull requests"** must be on. It is off by default, and with it off the workflow
 pushes the branch successfully and then fails on the PR step alone — every
 guard green, no PR, and the bump stranded on a branch nobody looks at.
+
+## Verification
+
+`.github/workflows/ci.yml` builds and checks a tree on every pull request and
+on every push to `main` or `dev`. Until it existed this repository had no
+push/PR CI at all: the only thing that ever built anything was the daily
+updater, so a commit stayed unverified until the next upstream bump happened to
+trip over it — and the bump, not the commit, is what looked broken.
+
+Branches are covered by their pull request rather than by their pushes, because
+covering both is not free. The two events produce different `github.ref`
+values, so no concurrency group can collapse them, and each run carries its own
+copy of the expensive job below. The cost of that rule is that a branch with no
+PR open gets no CI.
+
+It runs as two jobs, and the split is about exactly one derivation.
+`checks.cowork-fhs-paths` asserts against the trimmed QEMU — `qemu.override
+{ hostCpuOnly = true; … }` — and an override is a derivation no binary cache
+carries, so every run that needs it compiles QEMU from source. Measured, on a
+GitHub-hosted `ubuntu-24.04` runner with no cache: **10m05s** of QEMU and
+11m40s for the job, against ~18 minutes on this repository's own hardware.
+Everything a cache can serve stays in the other job, which finishes in about
+90 seconds.
+
+So the expensive job runs only when something it tests has moved: `flake.lock`,
+`flake.nix`, `pkgs/claude-desktop-fhs.nix` or `pkgs/cowork-fhs-paths.nix`.
+`sources.json` is deliberately not on that list — an upstream bump changes the
+app payload, not the QEMU, and `cowork-fhs-paths-full-qemu` re-runs every path
+assertion against the new rootfs on the cached QEMU anyway. When the gate
+cannot resolve its base commit at all — a new branch, a force-push — it runs
+the check rather than guessing.
+
+Two things keep that arrangement from silently covering less than it says:
+
+- **The gate is only allowed to skip work it can prove is unnecessary, and a
+  cancelled run can't prove anything.** A pull request's gate diffs against
+  `origin/<base>`, a fixed point, so superseding a run loses nothing. A push's
+  gate diffs against the tip immediately before that push, so cancelling one
+  loses the coverage permanently: the next push diffs from the commit whose
+  check never ran, sees nothing tracked move, and skips — and the unverified
+  change then sits in the baseline of every future diff. `dev` takes two
+  unattended pushes ten minutes apart daily, against a job that runs twelve, so
+  push runs are keyed per commit and only pull requests supersede each other.
+- **`.github/scripts/checks-accounted-for.sh`** compares `flake.nix`'s `checks`
+  attrset against the list each workflow names, and fails when they differ. A
+  check added to the flake and forgotten in a workflow would otherwise never
+  run, never be reported, and — in the updater's case — be contradicted by the
+  stable PR body, which tells its reader every check passed.
 
 ## Testing this package without touching your profile
 
@@ -414,19 +471,161 @@ tooling.
   pool. Adding it needs a second `sources.json` entry plus an updater that only
   bumps when both arches carry the same version. Deliberately left out of v1;
   see the `TODO(arm64)` markers.
-- **Cowork / KVM / Computer Use.** The `.deb` ships `virtiofsd`,
-  `cowork-linux-helper` and a 27 MB `smol-bin.x64.img`; none of it is wired up.
-  The app reports `computerUse: unsupported_platform` on Linux regardless.
+- **Computer Use.** The app reports `computerUse: unsupported_platform` on Linux
+  regardless of what this package provides. Nothing to wire.
+- **Cowork on `packages.default`.** Not an omission — it is not reachable. Two
+  of the three paths the probe needs are hardcoded absolute FHS locations with
+  no environment override, so only a mount namespace can satisfy them. See
+  [Cowork](#cowork).
 
-  **Cowork cannot start**, and that is by design here: the VM path requires
-  `qemuPath`, `firmwarePath` (OVMF) *and* `virtiofsd`, and neither qemu nor
-  OVMF is anywhere in this package's closure (`nix path-info -r … | grep -c
-  qemu` → `0`). `virtiofsd` is present only so `autoPatchelfHook` resolves its
-  `libseccomp` / `libcap-ng` and the build stays clean. Opening the Cowork tab
-  shows upstream's own message — *"requires QEMU. Install it with
-  `{installCommand}`, then restart Claude"* — where `{installCommand}` is an
-  **`apt` command that is wrong and unactionable on NixOS**. This is cosmetic;
-  nothing is broken by it.
+## Known gaps
+
+Guarantees that are weaker than they look. Each is recorded here rather than
+left implicit, because the failure mode in every case is *silence*: the build
+stays green, the app keeps running, and a feature is quietly dead or quietly
+degraded.
+
+- **`coworkProbe` is hand-transcribed and nothing rescans the payload.**
+  `checks.cowork-fhs-paths` asserts that the FHS tree presents the paths listed
+  in `passthru.coworkProbe` — but that list was read out of `app.asar` by hand,
+  and no check reconciles it against the bundle on a version bump. So the check
+  proves only that *we still create the paths we decided to create*, not that
+  those are still the paths the app looks for. If upstream moves them, every
+  assertion keeps passing and Cowork silently stops working.
+
+  This is the same shape as the `libsecret` gap that motivated
+  `checks.dlopen-runpath`: an invisible downgrade behind a green build. That
+  check solves it by rescanning the shipped ELFs on every run and failing on
+  anything unclassified; this one needs the equivalent — a scan of `app.asar`
+  for the probe's path literals, reconciled against `coworkProbe`, failing when
+  the bundle names something the list does not. Not implemented.
+
+- **The Cowork guest sees the whole sandbox root, and this variant adds no
+  isolation of its own.** `cowork-linux-helper` starts `virtiofsd` with
+  `--shared-dir / --sandbox none`, observed on a live run. Inside the FHS mount
+  namespace that `/` is the sandbox root, which ro-binds the host's filesystem
+  entry by entry — so the guest's `claudeshared` tag is a view of your machine,
+  not of a project directory you picked.
+
+  This is upstream's choice, made by the shipped helper binary, and it is not
+  fixable from packaging: the arguments are constructed inside
+  `cowork-linux-helper`, and changing them means patching that binary or
+  `app.asar`, which this repo does not do for any reason. Worth stating plainly
+  because it is easy to assume a VM boundary implies a filesystem boundary here,
+  and it does not — the hypervisor isolates execution, not the share. If you
+  need the stronger property, the containing bubblewrap composition is where it
+  would have to come from, and this output does not add one beyond what
+  `buildFHSEnv` already does.
+
+## Cowork
+
+`packages.claude-desktop-cowork` is the FHS variant plus the three host-side
+pieces Cowork's VM path needs. It exists as a separate output because the VM
+toolchain adds ~859 MiB to the FHS closure (~1.56 GiB over `packages.default`),
+and because wanting `npx` to resolve says nothing about wanting a hypervisor.
+
+**Verification status.** `checks.cowork-fhs-paths` proves the sandbox presents
+every path the probe searches, that the QEMU carried can create every device the
+helper asks for, and that it accepts the helper's `-sandbox` argument — the one
+requirement with no `-<kind> help` listing to enumerate, and the one a trim can
+remove while every other assertion still passes.
+
+The end-to-end path through the app — gate → helper → bundle download →
+`startVM` → booted guest — has been exercised by hand and evidenced, most
+recently on **1.32352.1**: a `qemu-system-x86_64 -name claude-cowork-vm` with
+`accel=kvm`, forked by `cowork-linux-helper`, holding `/dev/kvm`, two live
+`anon_inode:kvm-vcpu` fds and `/dev/vhost-vsock`; a `vhost-vsock-pci` device
+whose `guest-cid` matches the `guest connected from vm(…)` line in the helper's
+own log; a running `virtiofsd` behind a `vhost-user-fs-pci` with the
+`claudeshared` tag; `resources/smol-bin.x64.img` attached read-only. The guest
+reached Ubuntu 24.04 userspace, ran commands, and its systemd logged `Detected
+virtualization kvm`.
+
+**What booted it is no longer OVMF.** That capture shows a direct kernel boot —
+`-kernel vmlinuz -initrd initrd` out of the downloaded bundle, and not one
+`if=pflash` argument — with the helper's own log saying `direct kernel boot`. An
+earlier capture, on 1.24012.9, did boot through the `pflash` pair. So the
+firmware this repo supplies is required by the **gate**, which `access(R_OK)`s
+`OVMF_CODE_4M.fd` before any VM logic runs and closes Cowork if it is missing,
+and by the helper's conditional EFI path — not by the boot the app currently
+performs by default. `t14/fhs-boot-probe.nix` exercises that EFI path, which is
+why it is worth keeping and why a green probe says nothing about the direct
+kernel boot a real session takes.
+
+That run is reproducible via `t14/` (see `t14/README.md`), but it is a manual
+GUI test, not a check: nothing in CI or `nix flake check` re-runs it. On an
+upstream bump that touches Cowork it has to be re-run by hand, and until it is,
+the end-to-end claim describes the previous version.
+
+Why it cannot be a wrapper on `packages.default`: the app's probe resolves
+`qemuPath` by walking `$PATH`, but resolves `firmwarePath` and `virtiofsdPath`
+by `access(R_OK)` against hardcoded absolute paths —
+`/usr/share/OVMF/OVMF_CODE_4M.fd` (falling back to `OVMF_CODE.fd`) and
+`/usr/libexec/virtiofsd` (falling back to `/usr/bin/virtiofsd`). Neither
+consults an environment variable, `$PATH`, or anything relative to the app
+directory. No wrapper can satisfy them; a mount namespace can.
+
+The bundled `resources/virtiofsd` does not help. The app only consults its own
+copy when `/etc/os-release` reports `ID=ubuntu` and `VERSION_ID` starting `22.`,
+so on NixOS that binary is unreachable and the FHS tree must supply a real one.
+It is still in `buildInputs` for the base package so `autoPatchelfHook` resolves
+its `libseccomp` / `libcap-ng` and the build stays clean.
+
+Host requirements beyond the package: `/dev/kvm` and `/dev/vhost-vsock` must be
+readable and writable. On stock NixOS both are mode `0666` from systemd's own
+udev rules, so no group membership is needed, and `/dev/vhost-vsock` is a static
+node that demand-loads `vhost_vsock` on first open. Loading it explicitly is
+still worth doing:
+
+```nix
+boot.kernelModules = [ "vhost_vsock" ];
+```
+
+because if the demand-load ever fails, the app's fallback probe stats
+`/lib/modules/$(uname -r)` to decide whether the module is merely unloaded or
+the kernel cannot support it — and `/lib/modules` does not exist on NixOS at
+all. The `ENOENT` is read as *"the kernel doesn't include the virtualization
+support Cowork needs, and it can't be added manually"*, which is wrong here and
+sends you debugging the wrong layer.
+
+**Disk space — budget ~15 GB before the first Cowork session.** The guest root
+filesystem is not shipped in the `.deb`; the first run downloads it from
+`downloads.claude.ai` into `$XDG_CONFIG_HOME/Claude/vm_bundles/`:
+
+| file | size |
+| --- | --- |
+| `rootfs.img.zst` (the download) | 1.24 GiB |
+| `rootfs.img` (decompressed) | 10 GiB sparse |
+| `sessiondata.img` (created locally) | 10 GiB sparse |
+| `efivars.fd` | 528 KiB |
+
+Measured on a real first run: **~13 GB actually occupied**, ~23 GB apparent —
+the two images are sparse, so `du --apparent-size` and `df` disagree by a lot.
+Point `$XDG_CONFIG_HOME` somewhere with room; a small `/tmp`, a tmpfs, or a
+size-capped home partition will fail partway through the download or the
+decompression rather than up front.
+
+The bundled `smol-bin.x64.img` is a read-only FAT32 side-disk of guest daemons
+that the VM mounts *after* booting, not the boot image.
+
+`leanQemu` builds a trimmed headless QEMU instead of `qemu_kvm`, dropping the
+display, audio and smartcard front-ends a vsock-driven VM never touches. It
+roughly halves the marginal closure (446 MiB instead of 859 MiB over the FHS
+variant — most of the difference is `clang` and `llvm`, pulled in by
+`pipewire` → `ffmpeg`), at the cost of a source build that no cache carries.
+
+**On by default.** Everything the helper's argv names survives the trim, and
+that claim is held to the trimmed binary itself by `checks.cowork-fhs-paths`
+rather than to the untrimmed one where it could not fail. A guest has been
+booted end to end on it. If you would rather have the cached `qemu_kvm` and a
+faster first build:
+
+```nix
+claude-desktop-cowork.override { leanQemu = false; }
+```
+
+That path stays evaluated by `checks.cowork-fhs-paths-full-qemu`, so it cannot
+rot unnoticed.
 
 ## Licence
 
