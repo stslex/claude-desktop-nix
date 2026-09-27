@@ -74,22 +74,48 @@
           claude-desktop = self.packages.${system}.claude-desktop;
         in
         {
-          # Guards the two invariants that are easy to regress silently and
+          # Guards the invariants that are easy to regress silently and
           # impossible to notice from a green build: the wrapper must carry the
-          # Ozone + password-store flags, and must never acquire --no-sandbox.
+          # password-store flag, every flag it passes must be one the shipped
+          # Chromium still knows, and it must never acquire --no-sandbox.
           wrapper-flags =
             pkgs.runCommand "claude-desktop-wrapper-flags"
               {
-                nativeBuildInputs = [ pkgs.desktop-file-utils ];
+                nativeBuildInputs = [
+                  pkgs.binutils # strings
+                  pkgs.desktop-file-utils
+                ];
               }
               ''
                 wrapper=${claude-desktop}/bin/claude-desktop
                 test -x "$wrapper" || { echo "wrapper missing or not executable"; exit 1; }
 
-                grep -q -- '--ozone-platform-hint=auto' "$wrapper" \
-                  || { echo "FAIL: --ozone-platform-hint=auto not in wrapper"; exit 1; }
                 grep -q -- '--password-store=' "$wrapper" \
                   || { echo "FAIL: --password-store= not in wrapper"; exit 1; }
+
+                # Chromium ignores a switch it does not know, silently. The
+                # wrapper carried --ozone-platform-hint=auto for several upstream
+                # releases after Chromium had dropped it, and the assertion
+                # that it was present passed the whole time. So each flag the
+                # wrapper adds has to be named by the executable it runs.
+                #
+                # A substring match on purpose: switch names are
+                # tail-merged into longer strings often enough that an
+                # exact-line match would fail on a live flag. That leans
+                # towards passing, which is acceptable here. The failure this
+                # catches is a switch gone from the binary altogether.
+                exe=${claude-desktop}/lib/claude-desktop/claude-desktop
+                strings -a "$exe" > exe-strings
+                flags=0
+                while IFS= read -r flag; do
+                  name=''${flag#--}
+                  name=''${name%%=*}
+                  flags=$((flags + 1))
+                  grep -qF -- "$name" exe-strings \
+                    || { echo "FAIL: wrapper passes $flag, but the executable does not name '$name'"; exit 1; }
+                done < <(strings -a "$wrapper" | grep -E '^--[a-z][a-z0-9-]*(=|$)')
+                test "$flags" -gt 0 \
+                  || { echo "FAIL: found no flags in the wrapper; the extraction above is broken"; exit 1; }
 
                 if grep -q -- '--no-sandbox' "$wrapper"; then
                   echo "FAIL: wrapper passes --no-sandbox; the namespace sandbox must be used instead"
