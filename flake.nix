@@ -163,6 +163,15 @@
               leanQemu = false;
             };
           };
+
+          # The absolute paths inside app.asar that only the FHS rootfs can
+          # satisfy (busctl for the Wayland shortcut portal, ps, secret-tool),
+          # plus the loader the downloaded Claude Code CLI needs. Against the
+          # plain FHS variant: the paths are the same for cowork, and this way
+          # no QEMU is built for it.
+          fhs-host-paths = pkgs.callPackage ./pkgs/fhs-host-paths.nix {
+            claude-desktop-fhs = self.packages.${system}.claude-desktop-fhs;
+          };
         }
       );
 

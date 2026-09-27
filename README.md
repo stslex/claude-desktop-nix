@@ -17,12 +17,13 @@ $ nix run github:<you>/claude-desktop-nix
 | Output | What it is |
 | --- | --- |
 | `packages.default` / `packages.claude-desktop` | The app. Use this one. |
-| `packages.claude-desktop-fhs` | Same app inside a `buildFHSEnv` that provides `npx`, `uvx`, `docker`, `git`, `python3` at conventional FHS paths, so published MCP server configs work unmodified. |
+| `packages.claude-desktop-fhs` | Same app inside a `buildFHSEnv` that provides `npx`, `uvx`, `docker`, `git`, `python3` at conventional FHS paths, so published MCP server configs work unmodified. It also provides the absolute paths the app runs from inside `app.asar` (`/usr/bin/busctl`, which the Wayland Quick Entry shortcut depends on, plus `/bin/ps` and `/usr/bin/secret-tool`) and the glibc loader the downloaded Claude Code CLI needs, so neither envfs nor nix-ld is required. |
 | `packages.claude-desktop-cowork` | Same FHS sandbox, plus QEMU, OVMF and virtiofsd at the paths Cowork's VM probe searches. See [Cowork](#cowork). |
 | `packages.claude-desktop-dev` / `-dev-fhs` | The same build from the **dev** packaging channel — see [Channels](#channels). |
 | `overlays.default` | Adds `claude-desktop`, `claude-desktop-fhs`, `claude-desktop-cowork` and the `-dev` counterparts to a nixpkgs instance. |
 | `checks.wrapper-flags` | Asserts the wrapper keeps its flags, never gains `--no-sandbox`, ships `chrome-sandbox`, and has a valid desktop entry with rewritten `Exec=` lines. |
 | `checks.dlopen-runpath` | Scans every shipped ELF for soname strings and asserts that each library this package provides resolves from the RUNPATH of every object naming it, that nothing on the lists has stopped being named, and that nothing *new* is named without being classified. See [Dependency provenance](#dependency-provenance). |
+| `checks.fhs-host-paths` | Asserts the FHS rootfs presents every path in `passthru.fhsHostPaths` (`/usr/bin/busctl`, `/bin/ps`, `/usr/bin/secret-tool`, `/lib64/ld-linux-x86-64.so.2`) and that the three commands actually run. Built against the plain FHS variant, so no QEMU is compiled for it. |
 | `checks.cowork-fhs-paths` / `-full-qemu` | Asserts the Cowork sandbox presents every path the app's VM probe searches, that the OVMF code file has its matching vars file, and that the QEMU carried can actually create the devices the helper asks for. The unsuffixed one runs against the trimmed QEMU the package actually ships; `-full-qemu` runs the same assertions against the cached `qemu_kvm` that `leanQemu = false` selects. |
 
 ### NixOS

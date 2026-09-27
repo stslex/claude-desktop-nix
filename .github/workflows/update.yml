@@ -205,13 +205,14 @@ jobs:
         run: |
           set -euo pipefail
           .github/scripts/checks-accounted-for.sh \
-            wrapper-flags dlopen-runpath cowork-fhs-paths-full-qemu \
+            wrapper-flags dlopen-runpath cowork-fhs-paths-full-qemu fhs-host-paths \
             cowork-fhs-paths
 
           nix build -L \
             .#checks.x86_64-linux.wrapper-flags \
             .#checks.x86_64-linux.dlopen-runpath \
-            .#checks.x86_64-linux.cowork-fhs-paths-full-qemu
+            .#checks.x86_64-linux.cowork-fhs-paths-full-qemu \
+            .#checks.x86_64-linux.fhs-host-paths
 
           # Not built, but still forced through evaluation, so a rename or a
           # broken override fails the bump instead of waiting for ci.yml.

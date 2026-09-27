@@ -27,6 +27,12 @@
   # fail silently. Confirmed by a live run before this was added.
   xdg-utils,
 
+  # Absolute paths the app runs from inside app.asar. See appAbsolutePaths.
+  runCommand,
+  libsecret,
+  procps,
+  systemdMinimal,
+
   # --- Cowork VM toolchain (only referenced when `cowork` is true) -----------
   qemu,
   qemu_kvm,
@@ -153,6 +159,33 @@ let
     ovmf-fhs
     virtiofsd
   ];
+
+  # Commands the app runs by absolute path from inside app.asar. On the base
+  # package these resolve only if the host runs services.envfs (README, "NixOS
+  # host requirements"). Here the rootfs can simply provide them:
+  #
+  #   /usr/bin/busctl       the GlobalShortcuts portal probe, i.e. whether the
+  #                         Quick Entry shortcut exists at all on Wayland.
+  #                         Just the one binary: nothing else in the app looks
+  #                         for systemd's tools, and bringing all of them into
+  #                         the sandbox's /usr/bin would be surface for no use.
+  #   /bin/ps               process memory and CPU metrics.
+  #   /usr/bin/secret-tool  importing a browser's keyring-encrypted cookies
+  #                         into the Code browser pane.
+  #
+  # Deliberately *not* desktop-file-utils. With /usr/bin/update-desktop-database
+  # present, the app would write ~/.local/share/applications/
+  # com.anthropic.Claude.desktop from this rootfs's copy, whose Exec is the
+  # inner non-FHS wrapper, and it would shadow this variant's own launcher.
+  # Without it the app writes that file, fails the update and deletes it again.
+  appAbsolutePaths = [
+    (runCommand "busctl" { } ''
+      mkdir -p $out/bin
+      ln -s ${systemdMinimal}/bin/busctl $out/bin/busctl
+    '')
+    procps
+    libsecret
+  ];
 in
 buildFHSEnv {
   # Follows the wrapped package's channel, so a dev FHS build is not named
@@ -178,6 +211,7 @@ buildFHSEnv {
       which
       xdg-utils
     ]
+    ++ appAbsolutePaths
     ++ lib.optionals cowork coworkTargetPkgs;
 
   runScript = "${lib.getExe claude-desktop}";
@@ -201,6 +235,17 @@ buildFHSEnv {
   passthru = {
     inherit cowork leanQemu;
     inherit (claude-desktop) channel;
+
+    # What the sandbox has to present for the app's absolute paths (see
+    # appAbsolutePaths), plus the loader the downloaded Claude Code CLI names
+    # as its interpreter, which is why the Code tab needs no nix-ld here.
+    # Consumed by pkgs/fhs-host-paths.nix.
+    fhsHostPaths = [
+      "/usr/bin/busctl"
+      "/bin/ps"
+      "/usr/bin/secret-tool"
+      "/lib64/ld-linux-x86-64.so.2"
+    ];
 
     # The Cowork gate's search paths, verbatim from the constants in the app
     # bundle. Consumed by pkgs/cowork-fhs-paths.nix, which reconciles them

@@ -124,7 +124,8 @@ jobs:
             .#claude-desktop-fhs \
             .#checks.x86_64-linux.wrapper-flags \
             .#checks.x86_64-linux.dlopen-runpath \
-            .#checks.x86_64-linux.cowork-fhs-paths-full-qemu
+            .#checks.x86_64-linux.cowork-fhs-paths-full-qemu \
+            .#checks.x86_64-linux.fhs-host-paths
 
           # Prove the output is usable, not merely buildable — a bad
           # autoPatchelf run still produces a store path.
@@ -147,7 +148,7 @@ jobs:
           set -euo pipefail
           # cowork-fhs-paths is the lean-QEMU one, gated into its own job.
           .github/scripts/checks-accounted-for.sh \
-            wrapper-flags dlopen-runpath cowork-fhs-paths-full-qemu \
+            wrapper-flags dlopen-runpath cowork-fhs-paths-full-qemu fhs-host-paths \
             cowork-fhs-paths
 
           # Force the gated check through evaluation without building it.
