@@ -40,6 +40,7 @@
   systemdLibs,
 
   # Runtime-only (dlopen'd; invisible to autoPatchelfHook — see runtimeLibs).
+  fontconfig,
   gdk-pixbuf,
   krb5,
   libdbusmenu,
@@ -154,6 +155,12 @@ let
     libxcursor # libXcursor.so.1
     libx11 # libX11-xcb.so.1
     libxcb # libxcb-{dri3,glx,present,sync}
+    # libfontconfig.so.1 — the system fontconfig, dlopen'd since Electron 44
+    # alongside the statically bundled copy. Already in the closure and
+    # already loaded at startup through gtk3/pango/cairo's DT_NEEDED, so this
+    # adds nothing to the closure; it makes the executable reach the same
+    # file through its own RUNPATH instead of by that coincidence.
+    fontconfig
   ];
 
   # The same set, plus the GPU driver link, as a RUNPATH fragment. This is
@@ -387,6 +394,7 @@ stdenv.mkDerivation (finalAttrs: {
       "libxcb-glx.so.0"
       "libxcb-present.so.0"
       "libxcb-sync.so.1"
+      "libfontconfig.so.1" # system fontconfig (FcInit), new in Electron 44
     ];
 
     # Held to the resolve assertion but exempt from the reference assertion:
@@ -420,9 +428,20 @@ stdenv.mkDerivation (finalAttrs: {
         "libgssapi.so.2"
         "libgssapi.so.4"
         "libgtk-4.so.1" # GTK4; the payload links GTK3 (DT_NEEDED)
-        "libunity.so.4" # Ubuntu Unity launcher API; no such desktop
-        "libunity.so.6"
-        "libunity.so.9"
+
+        # ANGLE is statically linked into the executable since Electron 44
+        # (breaking changes: "ANGLE is statically linked on all platforms"),
+        # so the .deb stopped shipping libEGL.so and libGLESv2.so next to it
+        # — until 1.46388.2 they were bundled, which is what classified these
+        # two. Measured at 2.7032.0: the executable now carries ANGLE's own
+        # strings (libANGLE paths, the Vulkan renderer) that used to live in
+        # the bundled libGLESv2.so. libEGL_test.so is the name static-ANGLE
+        # Chromium builds give the shared ANGLE that its test suites load.
+        # Providing any of them would mean shipping a second ANGLE the app
+        # does not use.
+        "libEGL.so"
+        "libGLESv2.so"
+        "libEGL_test.so"
 
         # Supplied by the impure driver link (addDriverRunpath, last RUNPATH
         # entry) at runtime, never by the closure — nothing to assert in a
