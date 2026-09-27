@@ -318,9 +318,13 @@ stdenv.mkDerivation (finalAttrs: {
   # after a trailing backslash, silently ending the makeWrapper command.
   postFixup =
     let
+      # No Ozone flag. The wrapper used to pass --ozone-platform-hint=auto,
+      # which no shipped Chromium knows any more: the string is absent from
+      # the executable (checked at 1.46388.2 and 2.7032.0), and Electron 38
+      # made --ozone-platform default to `auto`, i.e. native Wayland whenever
+      # XDG_SESSION_TYPE=wayland. checks.wrapper-flags now fails on any flag
+      # the executable does not name.
       wrapperArgs = [
-        "--add-flags"
-        "--ozone-platform-hint=auto"
         "--add-flags"
         "--password-store=${passwordStore}"
       ]
