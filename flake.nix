@@ -141,6 +141,81 @@
                 touch $out
               '';
 
+          # The places where the payload assumes a Debian filesystem and the
+          # packaging can do something about it, each asserted by behaviour
+          # rather than by grepping for the fix. The ones packaging cannot
+          # reach — absolute paths inside app.asar — are in the README under
+          # "NixOS host requirements".
+          nixos-host-paths =
+            let
+              withSearchProvider = claude-desktop.override { gnomeSearchProvider = true; };
+            in
+            pkgs.runCommand "claude-desktop-nixos-host-paths" { } ''
+              app=${claude-desktop}
+
+              # 1. The $BROWSER shim Code sessions get runs clean where
+              #    /usr/bin/true does not exist — which includes this build
+              #    sandbox. Run it for real, against a stand-in xdg-open that
+              #    records what it was asked to open. Before the fix this
+              #    printed "//usr/bin/true: No such file or directory" three
+              #    times per call.
+              mkdir fake
+              printf '#!%s\nprintf "%%s\\n" "$1" > %s/opened\n' \
+                ${pkgs.runtimeShell} "$PWD" > fake/xdg-open
+              chmod +x fake/xdg-open
+              env -i PATH=${pkgs.coreutils}/bin:$PWD/fake HOME=$PWD \
+                $app/lib/claude-desktop/resources/claude-browser-shim.js \
+                https://example.com/opened-by-shim 2> shim-stderr \
+                || { echo "FAIL: the browser shim exited non-zero"; cat shim-stderr; exit 1; }
+              if [ -s shim-stderr ]; then
+                echo "FAIL: the browser shim wrote to stderr:"
+                cat shim-stderr
+                exit 1
+              fi
+              grep -qx 'https://example.com/opened-by-shim' opened \
+                || { echo "FAIL: the browser shim did not hand the URL to xdg-open"; exit 1; }
+
+              # 2. Every command the app runs by bare name, or by an absolute
+              #    path only envfs can resolve, is reachable from the PATH the
+              #    wrapper appends — and the wrapper really appends it.
+              grep -qF -- '${claude-desktop.wrapperPath}' $app/bin/claude-desktop \
+                || { echo "FAIL: the wrapper does not carry passthru.wrapperPath"; exit 1; }
+              IFS=: read -ra dirs <<< '${claude-desktop.wrapperPath}'
+              for tool in gio openssl secret-tool ps; do
+                found=""
+                for d in "''${dirs[@]}"; do
+                  if [ -x "$d/$tool" ]; then found=$d/$tool; break; fi
+                done
+                test -n "$found" \
+                  || { echo "FAIL: $tool is not on the wrapper's appended PATH"; exit 1; }
+                echo "ok      $tool -> $found"
+              done
+
+              # 3. The GNOME search provider: off by default, and when on,
+              #    installed where GNOME Shell and the session bus look, with
+              #    both /usr paths pointed into the store and its desktop id
+              #    naming the entry this package installs.
+              test ! -e $app/share/dbus-1 \
+                || { echo "FAIL: the default package installs the search provider"; exit 1; }
+              sp=${withSearchProvider}
+              ini=$sp/share/gnome-shell/search-providers/com.anthropic.Claude.search-provider.ini
+              svc=$sp/share/dbus-1/services/com.anthropic.Claude.SearchProvider.service
+              test -f "$ini" && test -f "$svc" \
+                || { echo "FAIL: search provider files missing"; exit 1; }
+              id=$(sed -n 's/^DesktopId=//p' "$ini")
+              test -f "$sp/share/applications/$id" \
+                || { echo "FAIL: search provider names desktop id '$id', which is not installed"; exit 1; }
+              read -r gjsBin flag script <<< "$(sed -n 's/^Exec=//p' "$svc")"
+              test -x "$gjsBin" && test "$flag" = -m && test -f "$script" \
+                || { echo "FAIL: search provider Exec does not resolve: $gjsBin $flag $script"; exit 1; }
+              case "$gjsBin $script" in
+                /nix/store/*' '/nix/store/*) ;;
+                *) echo "FAIL: search provider Exec is not a store path: $gjsBin $script"; exit 1 ;;
+              esac
+
+              touch $out
+            '';
+
           # Static regression guard for the dlopen'd libraries: resolve,
           # reference and novelty assertions against a fresh scan of the
           # shipped ELFs. The rationale, and the limits of a string scan, are

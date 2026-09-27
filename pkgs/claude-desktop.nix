@@ -56,6 +56,13 @@
   util-linux,
   vulkan-loader,
 
+  # Commands the app runs rather than libraries it loads — see wrapperPath
+  # and the resource fixes in installPhase.
+  coreutils,
+  openssl,
+  procps,
+  gjs,
+
   addDriverRunpath,
 
   sources ? lib.importJSON ../sources.json,
@@ -124,6 +131,14 @@
   # executable. Setting the variable while the bundled helper is still
   # present is silently ignored — so this option must also delete it.
   suidSandbox ? false,
+
+  # Install the GNOME Shell search provider the payload ships in
+  # resources/gnome-search-provider: sessions and "Ask Claude" in the
+  # Activities search. Upstream's postinst copies it into /usr/share on every
+  # install; here it is off by default because its D-Bus service runs under
+  # gjs, which adds ~90 MiB to a closure where only GNOME can use it. Measured
+  # at 2.7032.0: 90.2 MiB of gjs + spidermonkey + icu that nothing else pulls in.
+  gnomeSearchProvider ? false,
 }:
 
 let
@@ -178,6 +193,37 @@ let
   # RUNPATH removes that shadowing by construction rather than narrowing it.
   runtimeRpath = (map (p: "${lib.getLib p}/lib") runtimeLibs) ++ [
     "${addDriverRunpath.driverLink}/lib"
+  ];
+
+  # Commands the app runs, appended to PATH by the wrapper — *after* the
+  # user's own entries, so a host tool always wins and these only fill gaps.
+  # The app never sets PATH itself; everything it runs by bare name comes
+  # from what the wrapper hands it.
+  #
+  #   glib       gio: shell.trashItem. In the .deb's Depends
+  #              (`… | libglib2.0-bin | gvfs`).
+  #   openssl    `openssl verify -purpose codesigning -CApath /etc/ssl/certs`
+  #              on desktop extensions. Missing, every signed extension is
+  #              reported "unsigned", silently. nixpkgs' openssl finds the
+  #              NixOS bundle even though /etc/ssl/certs has no hash links
+  #              (checked: a root from ca-certificates.crt verifies OK).
+  #   libsecret  secret-tool, and procps's ps: the app calls these by
+  #   procps     absolute path (/usr/bin/secret-tool, /bin/ps), which on
+  #              NixOS only resolves with services.envfs — and envfs resolves
+  #              from the PATH of the process asking. Listing them here makes
+  #              envfs find them whatever the session PATH holds. See README,
+  #              "NixOS host requirements".
+  #
+  # Not xdg-utils, although the .deb Depends on it: every NixOS graphical
+  # session already has xdg-open (services.graphical-desktop, which X, every
+  # display manager and every programs.<wayland compositor> module turn on),
+  # and nixpkgs' copy brings ~90 MiB of perl for a binary the host's would
+  # shadow anyway. The FHS variant, which cannot see the host's, carries it.
+  wrapperPath = lib.makeBinPath [
+    glib
+    openssl
+    libsecret
+    procps
   ];
 in
 stdenv.mkDerivation (finalAttrs: {
@@ -311,6 +357,29 @@ stdenv.mkDerivation (finalAttrs: {
     substituteInPlace $out/share/applications/com.anthropic.Claude.desktop \
       --replace-fail 'Exec=claude-desktop ' "Exec=$out/bin/claude-desktop "
 
+    # The $BROWSER shim Code sessions get (copied out of resources/ by the
+    # app, so it has to be fixed here) is an sh/JS polyglot whose sh lines
+    # each start `//usr/bin/true;` — a path NixOS does not have, so every
+    # call printed "//usr/bin/true: No such file or directory" three times
+    # before carrying on. `/` + a store path keeps the leading `//`: still a
+    # JS comment, still a path sh can run.
+    substituteInPlace $out/lib/claude-desktop/resources/claude-browser-shim.js \
+      --replace-fail '//usr/bin/true' '/${coreutils}/bin/true'
+    ${lib.optionalString gnomeSearchProvider ''
+
+      # What upstream's postinst writes into /usr/share, with its two /usr
+      # paths pointed into the store. The provider opens results through the
+      # com.anthropic.Claude.desktop entry installed above.
+      sp=$out/lib/claude-desktop/resources/gnome-search-provider
+      install -Dm644 $sp/com.anthropic.Claude.search-provider.ini \
+        $out/share/gnome-shell/search-providers/com.anthropic.Claude.search-provider.ini
+      install -Dm644 $sp/com.anthropic.Claude.SearchProvider.service \
+        $out/share/dbus-1/services/com.anthropic.Claude.SearchProvider.service
+      substituteInPlace $out/share/dbus-1/services/com.anthropic.Claude.SearchProvider.service \
+        --replace-fail '/usr/bin/gjs' '${gjs}/bin/gjs' \
+        --replace-fail '/usr/lib/claude-desktop' "$out/lib/claude-desktop"
+    ''}
+
     runHook postInstall
   '';
 
@@ -334,6 +403,10 @@ stdenv.mkDerivation (finalAttrs: {
       wrapperArgs = [
         "--add-flags"
         "--password-store=${passwordStore}"
+        "--suffix"
+        "PATH"
+        ":"
+        wrapperPath
       ]
       ++ lib.optionals suidSandbox [
         "--set"
@@ -352,7 +425,7 @@ stdenv.mkDerivation (finalAttrs: {
     '';
 
   passthru = {
-    inherit channel;
+    inherit channel gnomeSearchProvider wrapperPath;
     inherit (source) url;
     updateScript = ./update.sh;
 

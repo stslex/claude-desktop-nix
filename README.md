@@ -21,6 +21,7 @@ $ nix run github:<you>/claude-desktop-nix
 | `packages.claude-desktop-dev` / `-dev-fhs` | The same build from the **dev** packaging channel — see [Channels](#channels). |
 | `overlays.default` | Adds `claude-desktop`, `claude-desktop-fhs` and their `-dev` counterparts to a nixpkgs instance. |
 | `checks.wrapper-flags` | Asserts the wrapper keeps `--password-store`, that every flag it passes is still named by the shipped executable (Chromium ignores unknown switches silently), that it never gains `--no-sandbox`, that `chrome-sandbox` ships, and that the desktop entry is valid with rewritten `Exec=` lines. |
+| `checks.nixos-host-paths` | Runs the `$BROWSER` shim in the build sandbox, where `/usr/bin/true` does not exist, and requires it to hand the URL to `xdg-open` with nothing on stderr. Also asserts that every command the app runs by name, or by an absolute path envfs resolves, is on the wrapper's appended `PATH`, and that the opt-in GNOME search provider installs with store-path `Exec` and a desktop id that exists. See [NixOS host requirements](#nixos-host-requirements). |
 | `checks.dlopen-runpath` | Scans every shipped ELF for soname strings and asserts that each library this package provides resolves from the RUNPATH of every object naming it, that nothing on the lists has stopped being named, and that nothing *new* is named without being classified. See [Dependency provenance](#dependency-provenance). |
 
 ### NixOS
@@ -387,6 +388,74 @@ launch the wrong thing, or get exit 126. And a throwaway profile is logged out,
 so it is the right tool for testing startup, library resolution and the
 sandbox, but not for a v10/v11 check, which needs a real authenticated session.
 
+## NixOS host requirements
+
+The app is built for Debian and Ubuntu, and a few of its assumptions about the
+filesystem are baked into `app.asar` as absolute paths. This package does not
+patch `app.asar`, so those cannot be fixed here. What each one costs you, and
+the host setting that restores it, measured against 2.7032.0:
+
+**`programs.nix-ld.enable = true;`: needed for the Code tab.** The app
+downloads the Claude Code CLI (and `uv`) into
+`~/.config/Claude/claude-code/<version>/` as ordinary glibc binaries, with
+`/lib64/ld-linux-x86-64.so.2` as their interpreter. Without nix-ld they cannot
+start, and neither can anything built on them: Code sessions, and Remote Control
+of Code sessions from your phone or claude.ai. The FHS variants provide the
+loader themselves.
+
+**`services.envfs.enable = true;`: needed for three absolute paths.** envfs
+answers `/bin/<cmd>` and `/usr/bin/<cmd>` from the `PATH` of whichever process
+asks. The wrapper appends `procps` and `libsecret` to that `PATH`, so these
+resolve even when your session `PATH` does not carry them:
+
+| Path the app runs | What stops working without it |
+| --- | --- |
+| `/usr/bin/busctl` | The **Quick Entry global shortcut on Wayland**. At startup the app asks the GlobalShortcuts portal for its version through `busctl`. When that fails it logs `GlobalShortcuts portal availability: false` and disables the shortcut, even when the portal is present. Measured on niri: the portal answers `u 1`, and 1.34493.1 logged `false` on every launch. |
+| `/bin/ps` | Process memory and CPU metrics (`children=unavailable(ps-failed)` in `main.log`). Telemetry only. |
+| `/usr/bin/secret-tool` | Importing Chrome, Chromium, Brave or Edge cookies into the Code browser pane. Without it, keyring-encrypted cookies are skipped. |
+
+**Don't use the in-app "Start on login" toggle.** It writes
+`~/.config/autostart/claude-desktop.desktop` with
+`Exec="<store path>/lib/claude-desktop/claude-desktop" --startup`. That path is
+the raw executable, not the wrapper, so an autostarted app gets no
+`--password-store` and no GTK environment.
+
+The missing `--password-store` is the part that bites. On sway, Hyprland, niri
+and similar sessions Chromium then falls back to `basic` (see
+[`--password-store`](#--password-store)). That is a different key from the one
+the cookies were written under, so it cannot decrypt the session you signed in
+with. The path also stops existing once an update is garbage-collected.
+
+Write the same file declaratively instead. The app reads the toggle from that
+file's presence, so it shows as on, and it only rewrites the file when you flip
+the toggle:
+
+```nix
+# home-manager
+xdg.configFile."autostart/claude-desktop.desktop".text = ''
+  [Desktop Entry]
+  Type=Application
+  Name=Claude
+  Exec=claude-desktop --startup
+  X-GNOME-Autostart-enabled=true
+'';
+```
+
+**Smaller things, no action needed:**
+
+- **Links opened from Code sessions** (`gh`, Python's `webbrowser`) go through
+  the `$BROWSER` shim, which opens them in the session's browser pane only if
+  `node` is on the session `PATH`. Otherwise they open in your browser. The shim
+  itself is fixed here: its `//usr/bin/true` lines no longer print errors.
+- **Launcher actions.** The app would add "Sessions Waiting for You" to its
+  launcher entry, but it builds that entry from
+  `/usr/share/applications/com.anthropic.Claude.desktop`, which NixOS does not
+  have. The two static actions, New Chat and New Code Session, still work.
+- **GNOME Shell search** (sessions and "Ask Claude" in Activities) is shipped by
+  upstream but not installed by default. Its D-Bus service runs under `gjs`,
+  which adds ~90 MiB to the closure and is useful only on GNOME. Enable it
+  with `claude-desktop.override { gnomeSearchProvider = true; }`.
+
 ## Known issues
 
 **`Failed to create file "/nix/store/…-mimeapps.list.XXXXXX": Read-only file
@@ -414,9 +483,17 @@ tooling.
   pool. Adding it needs a second `sources.json` entry plus an updater that only
   bumps when both arches carry the same version. Deliberately left out of v1;
   see the `TODO(arm64)` markers.
-- **Cowork / KVM / Computer Use.** The `.deb` ships `virtiofsd`,
-  `cowork-linux-helper` and a 27 MB `smol-bin.x64.img`; none of it is wired up.
-  The app reports `computerUse: unsupported_platform` on Linux regardless.
+- **Computer Use.** This is not available on Linux, and packaging cannot change
+  that. Checked in 2.7032.0:
+  - The feature gate is a hardcoded `new Set(["darwin","win32"])`.
+  - The action executor throws `computer-use executor not implemented for linux`.
+  - The Linux native module can inject X11 input (enigo over XTEST), but it has
+    no screen capture.
+
+  Enabling it would mean patching `app.asar` and writing the Linux executor
+  upstream does not ship. Anthropic's Linux docs list it as not yet available.
+- **Cowork / KVM.** The `.deb` ships `virtiofsd`, `cowork-linux-helper` and a
+  27 MB `smol-bin.x64.img`. None of it is wired up in this output.
 
   **Cowork cannot start**, and that is by design here: the VM path requires
   `qemuPath`, `firmwarePath` (OVMF) *and* `virtiofsd`, and neither qemu nor
