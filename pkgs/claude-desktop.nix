@@ -37,6 +37,7 @@
   nspr,
   nss,
   pango,
+  pipewire,
   systemdLibs,
 
   # Runtime-only (dlopen'd; invisible to autoPatchelfHook — see runtimeLibs).
@@ -301,6 +302,7 @@ stdenv.mkDerivation (finalAttrs: {
     (lib.getLib stdenv.cc.cc) # libstdc++.so.6 <- node-pty's pty.node
     libseccomp # libseccomp.so.2 <- resources/virtiofsd
     libcap_ng # libcap-ng.so.0  <- resources/virtiofsd
+    pipewire # libpipewire-0.3.so.0 <- @ant/claude-native's claude-native-binding.node
 
     # libgbm pulls libdrm in, but the .deb Depends on it explicitly and the
     # GPU process resolves it directly; keep it named rather than incidental.

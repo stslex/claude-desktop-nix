@@ -241,6 +241,12 @@ discarded — use `appendRunpaths`.
 autopatchelf stays clean, but neither is wired into any feature here — Cowork
 and KVM plumbing is out of scope.
 
+`@ant/claude-native`'s `claude-native-binding.node` (new after 2.9939.4) has
+`libpipewire-0.3.so.0` as `DT_NEEDED`, and upstream's `Depends` gained
+`libpipewire-0.3-0` and `xdg-desktop-portal` with it. The module carries the
+Wayland computer-use calls (`cuWayland*`: portal screen capture and input), so
+`pipewire` is in `buildInputs`; the portal is the host's to provide.
+
 **How this list is kept honest across upstream bumps.**
 `checks.dlopen-runpath` re-derives the picture from the binary on every run
 instead of trusting the hand-written list. It scans every shipped ELF for
